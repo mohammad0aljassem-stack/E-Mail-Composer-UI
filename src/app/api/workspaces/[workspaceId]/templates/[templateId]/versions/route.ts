@@ -1,5 +1,9 @@
 import { RPC, type TemplateVersionRecord } from "@/lib/phase2/contracts";
-import { validateTemplateDocument } from "@/lib/templates/template-document";
+import { toDbJson } from "@/lib/phase2/db-json";
+import {
+  declaredVariables,
+  validateTemplateDocument,
+} from "@/lib/templates/template-document";
 import { parseSubjectTemplate } from "@/lib/templates/subject-template";
 import {
   guardRequest,
@@ -74,6 +78,12 @@ export async function POST(
       { details: templateValidation.errors },
     );
   }
+  const schemaValidation = declaredVariables(payload.variableSchema ?? []);
+  if (!schemaValidation.ok) {
+    return jsonError(422, "invalid_body", "The variable schema is invalid.", {
+      details: schemaValidation.errors,
+    });
+  }
 
   // Scope check.
   const { data: template, error: readError } = await guard.context.supabase
@@ -90,8 +100,8 @@ export async function POST(
     {
       p_template_id: templateId,
       p_subject_template: subjectTemplate,
-      p_body_template_json: payload.bodyTemplateJson,
-      p_variable_schema: payload.variableSchema ?? [],
+      p_body_template_json: toDbJson(templateValidation.document),
+      p_variable_schema: toDbJson(schemaValidation.variables),
     },
   );
   if (error) return mapDatabaseError(error);

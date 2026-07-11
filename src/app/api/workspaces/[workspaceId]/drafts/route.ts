@@ -1,5 +1,6 @@
 import { validateDraftDocument } from "@/lib/composer/canonical";
 import { RPC, type DraftRecord } from "@/lib/phase2/contracts";
+import { toDbJson } from "@/lib/phase2/db-json";
 import {
   guardRequest,
   isUuid,
@@ -66,7 +67,7 @@ export async function POST(
   const { data, error } = await guard.context.supabase.rpc(RPC.createDraft, {
     p_workspace_id: workspaceId,
     p_subject: subject,
-    p_body_json: validation.document,
+    p_body_json: toDbJson(validation.document),
   });
   if (error) return mapDatabaseError(error);
   return Response.json(

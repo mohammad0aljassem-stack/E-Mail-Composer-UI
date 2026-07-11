@@ -1,5 +1,9 @@
 import { RPC, type TemplateRecord } from "@/lib/phase2/contracts";
-import { validateTemplateDocument } from "@/lib/templates/template-document";
+import { toDbJson } from "@/lib/phase2/db-json";
+import {
+  declaredVariables,
+  validateTemplateDocument,
+} from "@/lib/templates/template-document";
 import { parseSubjectTemplate } from "@/lib/templates/subject-template";
 import {
   guardRequest,
@@ -82,6 +86,12 @@ export async function POST(
       { details: templateValidation.errors },
     );
   }
+  const schemaValidation = declaredVariables(payload.variableSchema ?? []);
+  if (!schemaValidation.ok) {
+    return jsonError(422, "invalid_body", "The variable schema is invalid.", {
+      details: schemaValidation.errors,
+    });
+  }
 
   const { data: template, error: insertError } = await guard.context.supabase
     .from("draft_templates")
@@ -100,8 +110,8 @@ export async function POST(
     await guard.context.supabase.rpc(RPC.createTemplateVersion, {
       p_template_id: (template as { id: string }).id,
       p_subject_template: subjectTemplate,
-      p_body_template_json: payload.bodyTemplateJson,
-      p_variable_schema: payload.variableSchema ?? [],
+      p_body_template_json: toDbJson(templateValidation.document),
+      p_variable_schema: toDbJson(schemaValidation.variables),
     });
   if (versionError) return mapDatabaseError(versionError);
 

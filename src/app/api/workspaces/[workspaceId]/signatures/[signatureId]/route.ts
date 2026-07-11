@@ -1,5 +1,7 @@
 import { validateDraftDocument } from "@/lib/composer/canonical";
 import { RPC, type SignatureRecord } from "@/lib/phase2/contracts";
+import { toDbJson } from "@/lib/phase2/db-json";
+import type { Database } from "@/lib/supabase/database.types";
 import {
   guardRequest,
   isUuid,
@@ -13,6 +15,8 @@ export const runtime = "nodejs";
 interface RouteParams {
   params: Promise<{ workspaceId: string; signatureId: string }>;
 }
+
+type SignatureUpdate = Database["public"]["Tables"]["signatures"]["Update"];
 
 export async function PATCH(
   request: Request,
@@ -33,7 +37,7 @@ export async function PATCH(
     setDefault?: unknown;
   };
 
-  const update: Record<string, unknown> = {};
+  const update: SignatureUpdate = {};
   if (payload.name !== undefined) {
     if (
       typeof payload.name !== "string" ||
@@ -54,7 +58,7 @@ export async function PATCH(
         { details: validation.errors },
       );
     }
-    update.body_json = validation.document;
+    update.body_json = toDbJson(validation.document);
   }
 
   if (Object.keys(update).length > 0) {

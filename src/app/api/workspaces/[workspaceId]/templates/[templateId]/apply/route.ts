@@ -3,6 +3,7 @@ import {
   type SaveDraftResult,
   type TemplateVersionRecord,
 } from "@/lib/phase2/contracts";
+import { toDbJson } from "@/lib/phase2/db-json";
 import { applyTemplate } from "@/lib/templates/apply-template";
 import {
   guardRequest,
@@ -117,7 +118,7 @@ export async function POST(
     p_draft_id: payload.draftId,
     p_expected_revision: payload.expectedRevision,
     p_subject: applied.subject,
-    p_body_json: applied.document,
+    p_body_json: toDbJson(applied.document),
     p_save_reason: "after_template",
   });
   if (saveError) return mapDatabaseError(saveError);

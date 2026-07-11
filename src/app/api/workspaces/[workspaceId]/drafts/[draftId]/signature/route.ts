@@ -4,6 +4,7 @@ import {
   type SaveDraftResult,
   type SignatureRecord,
 } from "@/lib/phase2/contracts";
+import { toDbJson } from "@/lib/phase2/db-json";
 import { applySignature } from "@/lib/signatures/apply-signature";
 import {
   guardRequest,
@@ -104,7 +105,7 @@ export async function POST(
     p_draft_id: draftId,
     p_expected_revision: payload.expectedRevision,
     p_subject: (draft as { subject: string }).subject,
-    p_body_json: applied,
+    p_body_json: toDbJson(applied),
     p_save_reason: "after_signature",
   });
   if (saveError) return mapDatabaseError(saveError);

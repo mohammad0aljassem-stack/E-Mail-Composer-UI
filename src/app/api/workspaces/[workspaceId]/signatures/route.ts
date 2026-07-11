@@ -1,5 +1,6 @@
 import { validateDraftDocument } from "@/lib/composer/canonical";
 import { type SignatureRecord } from "@/lib/phase2/contracts";
+import { toDbJson } from "@/lib/phase2/db-json";
 import {
   guardRequest,
   isUuid,
@@ -76,7 +77,7 @@ export async function POST(
       workspace_id: workspaceId,
       owner_user_id: guard.context.userId,
       name: payload.name,
-      body_json: validation.document,
+      body_json: toDbJson(validation.document),
     })
     .select("*")
     .single();

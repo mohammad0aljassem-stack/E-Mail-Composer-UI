@@ -4,6 +4,7 @@ import {
   type DraftRecord,
   type SaveDraftResult,
 } from "@/lib/phase2/contracts";
+import { toDbJson } from "@/lib/phase2/db-json";
 import {
   guardRequest,
   isUuid,
@@ -107,7 +108,7 @@ export async function PATCH(
     p_draft_id: draftId,
     p_expected_revision: payload.expectedRevision,
     p_subject: subject,
-    p_body_json: validation.document,
+    p_body_json: toDbJson(validation.document),
     p_save_reason: saveReason,
   });
   if (error) return mapDatabaseError(error);

@@ -108,7 +108,7 @@ production core schema. Instead:
   deployable** artifact of Phase 2 (additive).
 
 Run the database + RLS test suite against an isolated local PostgreSQL
-(no Docker required, PostgreSQL 16 binaries needed):
+(no Docker required for the tests; PostgreSQL 16 binaries needed):
 
 ```bash
 pnpm test:db          # throwaway cluster: baseline -> migration (applied
@@ -117,12 +117,20 @@ pnpm gen:types        # regenerate src/lib/supabase/database.types.ts
                       # (needs DB_URL and Docker; see scripts/gen-types.sh)
 ```
 
-CI runs the same database suite in an isolated job. Type regeneration
-(`gen:types`) requires Docker (the Supabase CLI runs pg_meta in a
-container), so the types drift check is a developer-machine step, not a
-CI gate. **The production migration is never applied automatically** —
-production deployment is a separate, explicitly approved operational step
-(see `docs/security/phase-2-review.md`).
+`src/lib/supabase/database.types.ts` is **generated** by the official
+Supabase CLI (`supabase gen types typescript --db-url ...`) from the local
+post-migration schema — never hand-edited, never generated from
+production. Generation needs a Docker daemon because the CLI runs
+postgres-meta in a container.
+
+CI's database job replays the same pipeline and enforces both gates:
+it loads the baseline, applies the Phase 2 migration twice (idempotency),
+runs the SQL/RLS suites, then regenerates the types from that exact
+schema and **fails on any byte-level drift** from the committed file
+("Verify generated database types are current"). **The production
+migration is never applied automatically** — production deployment is a
+separate, explicitly approved operational step (see
+`docs/security/phase-2-review.md`).
 
 ## Draft lifecycle (Phase 2)
 
