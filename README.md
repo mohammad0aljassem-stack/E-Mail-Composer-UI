@@ -111,16 +111,18 @@ Run the database + RLS test suite against an isolated local PostgreSQL
 (no Docker required, PostgreSQL 16 binaries needed):
 
 ```bash
-pnpm test:db          # throwaway cluster: baseline -> migration -> SQL tests
+pnpm test:db          # throwaway cluster: baseline -> migration (applied
+                      # twice, idempotency check) -> SQL test suites
 pnpm gen:types        # regenerate src/lib/supabase/database.types.ts
-                      # (needs DB_URL; see scripts/gen-types.sh)
+                      # (needs DB_URL and Docker; see scripts/gen-types.sh)
 ```
 
-CI runs the same suite in an isolated job and fails if the committed
-generated types drift from the migrated schema. **The production migration
-is never applied automatically** — production deployment is a separate,
-explicitly approved operational step (see
-`docs/security/phase-2-review.md`).
+CI runs the same database suite in an isolated job. Type regeneration
+(`gen:types`) requires Docker (the Supabase CLI runs pg_meta in a
+container), so the types drift check is a developer-machine step, not a
+CI gate. **The production migration is never applied automatically** —
+production deployment is a separate, explicitly approved operational step
+(see `docs/security/phase-2-review.md`).
 
 ## Draft lifecycle (Phase 2)
 

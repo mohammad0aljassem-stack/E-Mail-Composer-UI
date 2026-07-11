@@ -15,10 +15,7 @@ export default defineConfig({
     include: ["src/tests/**/*.test.{ts,tsx}"],
     coverage: {
       provider: "v8",
-      include: [
-        "src/lib/composer/**",
-        "src/server/render/**",
-      ],
+      include: ["src/lib/composer/**", "src/server/render/**"],
       thresholds: {
         "src/lib/composer/**": {
           statements: 90,

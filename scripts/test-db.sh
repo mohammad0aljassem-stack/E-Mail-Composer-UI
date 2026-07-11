@@ -11,114 +11,135 @@
 #
 # The --keep mode is used by CI to keep the database alive for type generation:
 #   bash scripts/test-db.sh --keep > /tmp/db.txt
-#   DB_URL=$(grep postgresql /tmp/db.txt | grep -oE 'postgresql://[^ ]+' | tail -1)
+#   DB_URL=$(grep -oE 'postgresql://[^ ]+' /tmp/db.txt | tail -1)
 #   DB_URL="$DB_URL" bash scripts/gen-types.sh --check
 set -eu
 
 cd "$(dirname "$0")/.."
 
 KEEP="${1:-}"
-DATA_DIR="/tmp/pg-e-mail-composer-$$"
-PORT=54329
+DATA_DIR="${TEST_DB_DATA_DIR:-/tmp/pg-e-mail-composer}"
+PORT="${TEST_DB_PORT:-54329}"
+DB_NAME=e_mail_composer
 PSQL_ARGS=(-U postgres -p "$PORT" -h localhost)
 
-# Cleanup function (trap-safe)
+# Debian/Ubuntu apt packages install the server binaries (initdb, pg_ctl)
+# under /usr/lib/postgresql/<ver>/bin, which is NOT on PATH — only client
+# wrappers like psql are. Pick the newest version dir if initdb is missing.
+if ! command -v initdb >/dev/null 2>&1; then
+  PG_BIN="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1 || true)"
+  if [[ -z "$PG_BIN" ]]; then
+    echo "ERROR: initdb not found and no /usr/lib/postgresql/*/bin directory." >&2
+    echo "Install PostgreSQL 16 server binaries (apt-get install postgresql-16)." >&2
+    exit 1
+  fi
+  export PATH="$PG_BIN:$PATH"
+fi
+
+STARTED_CLUSTER=0
+
+# initdb/postgres refuse to run as root (common in dev sandboxes). In that
+# case run the cluster as the unprivileged postgres system user; clients
+# still connect over localhost with trust auth, so psql as root is fine.
+CLUSTER_USER=""
+if [[ "$(id -u)" == "0" ]] && id postgres >/dev/null 2>&1; then
+  CLUSTER_USER="postgres"
+fi
+
+run_cluster_cmd() {
+  if [[ -n "$CLUSTER_USER" ]]; then
+    su -s /bin/bash "$CLUSTER_USER" -c "PATH='$PATH' $1"
+  else
+    bash -c "$1"
+  fi
+}
+
 cleanup() {
-  if [[ "$KEEP" != "--keep" && -d "$DATA_DIR" ]]; then
-    pg_ctl -D "$DATA_DIR" stop -m fast 2>/dev/null || true
+  if [[ "$KEEP" != "--keep" && "$STARTED_CLUSTER" == "1" && -d "$DATA_DIR" ]]; then
+    run_cluster_cmd "pg_ctl -D '$DATA_DIR' stop -m fast" >/dev/null 2>&1 || true
     rm -rf "$DATA_DIR"
   fi
 }
 trap cleanup EXIT
 
-# Check if a PostgreSQL cluster is already running on this port
 check_existing() {
-  pg_isready -U postgres -p "$PORT" -h localhost >/dev/null 2>&1 || return 1
+  pg_isready -U postgres -p "$PORT" -h localhost >/dev/null 2>&1
 }
 
-# Initialize a new PostgreSQL cluster
 init_db() {
-  echo "Initializing PostgreSQL 16 cluster at port $PORT..."
+  echo "Initializing PostgreSQL cluster (data dir $DATA_DIR, port $PORT)..."
+  rm -rf "$DATA_DIR" "$DATA_DIR.initdb.log" "$DATA_DIR.pg.log"
   mkdir -p "$DATA_DIR"
-  if ! initdb -D "$DATA_DIR" -A trust -U postgres >/dev/null 2>&1; then
-    echo "ERROR: initdb failed. Check /tmp for existing PG processes or permission issues." >&2
+  if [[ -n "$CLUSTER_USER" ]]; then
+    chown "$CLUSTER_USER" "$DATA_DIR"
+  fi
+  # Logs live NEXT TO the data dir: initdb requires the data dir to be empty.
+  if ! run_cluster_cmd "initdb -D '$DATA_DIR' -A trust -U postgres" > "$DATA_DIR.initdb.log" 2>&1; then
+    echo "ERROR: initdb failed:" >&2
+    tail -20 "$DATA_DIR.initdb.log" >&2 || true
     exit 1
   fi
 }
 
-# Start PostgreSQL server
 start_db() {
   echo "Starting PostgreSQL server on port $PORT..."
-  if ! pg_ctl -D "$DATA_DIR" start -w -l "$DATA_DIR/pg.log" -o "-p $PORT" 2>&1 | grep -q "done"; then
-    echo "ERROR: pg_ctl start failed. Log:" >&2
-    tail -20 "$DATA_DIR/pg.log" 2>/dev/null || echo "  (log file not found)"
+  if [[ -n "$CLUSTER_USER" ]]; then
+    touch "$DATA_DIR.pg.log" && chown "$CLUSTER_USER" "$DATA_DIR.pg.log"
+  fi
+  if ! run_cluster_cmd "pg_ctl -D '$DATA_DIR' start -w -t 60 -l '$DATA_DIR.pg.log' -o '-p $PORT -k /tmp -c listen_addresses=localhost'" >/dev/null 2>&1; then
+    echo "ERROR: pg_ctl start failed:" >&2
+    tail -30 "$DATA_DIR.pg.log" >&2 || true
+    exit 1
+  fi
+  STARTED_CLUSTER=1
+}
+
+create_db() {
+  # Recreate the DB so every run starts from a clean schema.
+  psql "${PSQL_ARGS[@]}" -d postgres -q \
+    -c "DROP DATABASE IF EXISTS $DB_NAME;" \
+    -c "CREATE DATABASE $DB_NAME;"
+}
+
+apply_sql() {
+  local label="$1" file="$2" out
+  echo "$label ($file)..."
+  if ! out="$(psql "${PSQL_ARGS[@]}" -d "$DB_NAME" -v ON_ERROR_STOP=1 -q -f "$file" 2>&1)"; then
+    echo "ERROR: $label failed:" >&2
+    printf '%s\n' "$out" | tail -40 >&2
     exit 1
   fi
 }
 
-# Wait for PostgreSQL to be ready
-wait_ready() {
-  local attempts=0
-  while ! pg_isready -U postgres -p "$PORT" -h localhost >/dev/null 2>&1; do
-    attempts=$((attempts + 1))
-    if [[ $attempts -gt 30 ]]; then
-      echo "PostgreSQL failed to start after 30 attempts" >&2
-      exit 1
-    fi
-    sleep 1
-  done
+run_test_suite() {
+  local file="$1" out
+  echo "Running tests: $(basename "$file")"
+  if ! out="$(psql "${PSQL_ARGS[@]}" -d "$DB_NAME" -v ON_ERROR_STOP=1 -f "$file" 2>&1)"; then
+    printf '%s\n' "$out" | tail -60 >&2
+    echo "FAIL: $file" >&2
+    exit 1
+  fi
+  local passed
+  passed="$(printf '%s\n' "$out" | grep -cE 'ok - ' || true)"
+  echo "  $passed assertions passed"
 }
 
-# Create the application database if it doesn't exist
-create_db() {
-  psql "${PSQL_ARGS[@]}" -d postgres -c "CREATE DATABASE e_mail_composer;" 2>/dev/null || true
-}
-
-# Load the baseline schema and Phase 2 migration
-load_schema() {
-  local db="${PSQL_ARGS[@]}"
-
-  echo "Loading baseline schema..."
-  psql "${db[@]}" -d e_mail_composer \
-    -v ON_ERROR_STOP=1 \
-    -f supabase/baseline/production_schema_2026_07_11.sql >/dev/null
-
-  echo "Applying Phase 2 migration..."
-  psql "${db[@]}" -d e_mail_composer \
-    -v ON_ERROR_STOP=1 \
-    -f supabase/migrations/20260711130000_draft_lifecycle.sql >/dev/null
-}
-
-# Run SQL test suite
-run_tests() {
-  local test_file="$1"
-  local test_name=$(basename "$test_file" .sql)
-
-  echo "Running tests: $test_name"
-  psql "${PSQL_ARGS[@]}" -d e_mail_composer \
-    -v ON_ERROR_STOP=1 \
-    -f "$test_file" 2>&1 | grep -E '^(NOTICE|WARNING|ERROR|FATAL)' || true
-}
-
-# Main execution
 echo "Phase 2 Database Test Runner"
 echo "============================"
 
 if check_existing; then
-  echo "Found existing PostgreSQL cluster on port $PORT, reusing..."
-  # Still ensure our database exists
-  create_db
+  echo "Reusing PostgreSQL cluster already running on port $PORT."
 else
-  echo "No existing cluster found, starting fresh..."
   init_db
   start_db
-  wait_ready
-  create_db
 fi
+create_db
 
-load_schema
+apply_sql "Loading baseline schema" supabase/baseline/production_schema_2026_07_11.sql
+apply_sql "Applying Phase 2 migration" supabase/migrations/20260711130000_draft_lifecycle.sql
+# Idempotency: the migration must be safely re-runnable.
+apply_sql "Re-applying Phase 2 migration (idempotency check)" supabase/migrations/20260711130000_draft_lifecycle.sql
 
-# Run all SQL test files in order
 test_dir="supabase/tests/database"
 if [[ ! -d "$test_dir" ]]; then
   echo "ERROR: test directory not found: $test_dir" >&2
@@ -127,29 +148,24 @@ fi
 
 test_count=0
 for test_file in "$test_dir"/*.test.sql; do
-  if [[ -f "$test_file" ]]; then
-    run_tests "$test_file"
-    test_count=$((test_count + 1))
-  fi
+  [[ -f "$test_file" ]] || continue
+  run_test_suite "$test_file"
+  test_count=$((test_count + 1))
 done
 
 if [[ $test_count -eq 0 ]]; then
-  echo "WARNING: No test files found in $test_dir" >&2
+  echo "ERROR: no test files found in $test_dir" >&2
+  exit 1
 fi
 
 echo ""
-echo "Database tests completed successfully."
+echo "Database tests completed successfully ($test_count suite(s))."
 
 if [[ "$KEEP" == "--keep" ]]; then
-  DB_URL="postgresql://postgres@localhost:$PORT/e_mail_composer"
   echo ""
-  echo "Database kept running (--keep flag):"
-  echo "  DB_URL=$DB_URL"
+  echo "Database kept running (--keep):"
+  echo "  DB_URL=postgresql://postgres@localhost:$PORT/$DB_NAME"
   echo ""
-  echo "To keep it alive in another terminal:"
-  echo "  export DB_URL='$DB_URL'"
-  echo ""
-  echo "When done, kill it manually:"
-  echo "  pkill -f 'postgres.*-p $PORT' || true"
-  echo "  rm -rf $DATA_DIR"
+  echo "Stop it later with:"
+  echo "  pg_ctl -D $DATA_DIR stop -m fast && rm -rf $DATA_DIR"
 fi

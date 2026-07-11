@@ -24,8 +24,8 @@ function walk(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-const sourceFiles = walk(join(ROOT, "src")).filter((file) =>
-  /\.(ts|tsx|css)$/.test(file) && !/\/tests\//.test(file),
+const sourceFiles = walk(join(ROOT, "src")).filter(
+  (file) => /\.(ts|tsx|css)$/.test(file) && !/\/tests\//.test(file),
 );
 
 describe("service-role key exposure", () => {

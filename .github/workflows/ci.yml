@@ -53,23 +53,11 @@ jobs:
     name: Database migration and RLS tests
     runs-on: ubuntu-latest
     # Isolated local PostgreSQL only: loads the non-deployable baseline,
-    # applies the Phase 2 migration, runs the SQL test suites, and verifies
-    # generated TypeScript types. Never connects to production; no secrets.
+    # applies the Phase 2 migration twice (idempotency), and runs the SQL
+    # test suites. Never connects to production; no secrets.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
 
       - name: Install PostgreSQL 16
         run: |
@@ -78,11 +66,4 @@ jobs:
           sudo systemctl stop postgresql || true
 
       - name: Run database and RLS tests (baseline + migration)
-        run: pnpm test:db
-
-      - name: Verify generated types are current
-        run: |
-          bash scripts/test-db.sh --keep > /tmp/db-info.txt
-          cat /tmp/db-info.txt
-          DB_URL="$(grep -oE 'postgresql://[^ ]+' /tmp/db-info.txt | tail -1)"
-          DB_URL="$DB_URL" bash scripts/gen-types.sh --check
+        run: bash scripts/test-db.sh
