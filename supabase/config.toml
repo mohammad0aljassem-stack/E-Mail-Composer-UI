@@ -1,0 +1,8 @@
+# Minimal Supabase CLI configuration for E-Mail-Composer-UI.
+# Only what the CLI needs to associate this directory with the project and
+# run `supabase db` commands locally; everything else uses CLI defaults.
+
+project_id = "e-mail-composer-ui"
+
+[db]
+port = 54322

@@ -40,5 +40,62 @@ jobs:
       - name: Unit tests
         run: pnpm test
 
+      - name: Coverage thresholds
+        run: pnpm test:coverage
+
       - name: Production build
         run: pnpm build
+
+      - name: Production dependency audit (high+)
+        run: pnpm audit --prod --audit-level high
+
+  database:
+    name: Database migration and RLS tests
+    runs-on: ubuntu-latest
+    # Isolated local PostgreSQL only: loads the non-deployable baseline,
+    # applies the Phase 2 migration twice (idempotency), and runs the SQL
+    # and RLS test suites. Then regenerates database types from the
+    # post-migration schema with the official Supabase CLI (which runs
+    # postgres-meta in Docker) and fails on any byte-level drift from the
+    # committed src/lib/supabase/database.types.ts. Never connects to
+    # production; no secrets.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install PostgreSQL 16
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q postgresql-16 postgresql-client-16
+          sudo systemctl stop postgresql || true
+
+      - name: Run database and RLS tests (baseline + migration)
+        run: bash scripts/test-db.sh
+
+      - name: Verify Docker is available
+        run: docker info > /dev/null
+
+      - name: Verify generated database types are current
+        run: |
+          bash scripts/test-db.sh --keep > /tmp/db-info.txt
+          DB_URL="$(grep -oE 'postgresql://[^ ]+' /tmp/db-info.txt | tail -1)"
+          DB_URL="$DB_URL" bash scripts/gen-types.sh --check
+
+      - name: Stop kept database cluster
+        if: always()
+        run: |
+          export PATH="/usr/lib/postgresql/16/bin:$PATH"
+          pg_ctl -D /tmp/pg-e-mail-composer stop -m fast || true
+          rm -rf /tmp/pg-e-mail-composer /tmp/pg-e-mail-composer.initdb.log /tmp/pg-e-mail-composer.pg.log || true

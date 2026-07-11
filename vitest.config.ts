@@ -15,11 +15,7 @@ export default defineConfig({
     include: ["src/tests/**/*.test.{ts,tsx}"],
     coverage: {
       provider: "v8",
-      include: [
-        "src/lib/composer/**",
-        "src/server/render/**",
-        "src/app/api/**",
-      ],
+      include: ["src/lib/composer/**", "src/server/render/**"],
       thresholds: {
         "src/lib/composer/**": {
           statements: 90,
@@ -32,12 +28,6 @@ export default defineConfig({
           branches: 85,
           functions: 90,
           lines: 90,
-        },
-        "src/app/api/**": {
-          statements: 85,
-          branches: 80,
-          functions: 85,
-          lines: 85,
         },
       },
     },

@@ -16,11 +16,16 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "test:db": "bash scripts/test-db.sh",
+    "gen:types": "bash scripts/gen-types.sh",
+    "audit:prod": "pnpm audit --prod --audit-level high"
   },
   "dependencies": {
     "@react-email/components": "1.0.12",
     "@react-email/render": "2.1.0",
+    "@supabase/ssr": "0.12.0",
+    "@supabase/supabase-js": "2.110.2",
     "@tiptap/core": "2.27.2",
     "@tiptap/extension-link": "2.27.2",
     "@tiptap/pm": "2.27.2",
@@ -43,6 +48,7 @@
     "eslint-config-next": "16.2.10",
     "jsdom": "29.1.1",
     "prettier": "3.9.5",
+    "supabase": "2.109.1",
     "typescript": "5.9.3",
     "vitest": "4.1.10"
   }
