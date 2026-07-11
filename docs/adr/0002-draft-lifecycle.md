@@ -129,7 +129,8 @@ The UI operates exclusively as the authenticated user through the publishable
 key. A service-role key would bypass RLS wholesale, so a single application
 bug (or dependency compromise) would become a full data breach across every
 workspace. There is deliberately no service-role environment variable in this
-application; CI greps guard against reintroduction.
+application; a repository boundary test suite (`phase2-boundaries.test.ts`,
+run by CI) guards against reintroduction.
 
 ### Why the production migration is not automatic
 

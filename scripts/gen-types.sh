@@ -45,23 +45,45 @@ generate() {
 # Fail-closed validation: the Supabase CLI can print a JSON error object
 # (e.g. {"_tag":"Error",...}) to stdout without exiting non-zero. Never
 # accept output that does not look like the generated TypeScript module.
-validate_generated() {
+looks_valid() {
   local file="$1"
-  if ! grep -q 'export type Json' "$file" ||
-    ! grep -q 'public: {' "$file" ||
-    grep -q '"_tag":"Error"' "$file"; then
-    echo "ERROR: generated output does not look like valid database types." >&2
-    echo "First 20 lines of the output:" >&2
-    head -20 "$file" >&2
-    exit 1
-  fi
+  grep -q 'export type Json' "$file" &&
+    grep -q 'public: {' "$file" &&
+    ! grep -q '"_tag":"Error"' "$file"
+}
+
+# Generation is deterministic, but fetching the postgres-meta image is not:
+# anonymous registry pulls from shared CI runner IPs intermittently hit
+# "toomanyrequests: Rate exceeded". Retry ONLY the generation (a drift diff
+# is deterministic and is never retried).
+generate_with_retry() {
+  local target="$1" attempt delay
+  for attempt in 1 2 3 4; do
+    if { printf '%s\n' "$HEADER"; generate; } > "$target" 2> "$target.err" &&
+      looks_valid "$target"; then
+      rm -f "$target.err"
+      return 0
+    fi
+    if [[ $attempt -lt 4 ]]; then
+      delay=$((10 * 2 ** (attempt - 1)))
+      echo "Type generation attempt $attempt failed (transient registry or" >&2
+      echo "network issue?); retrying in ${delay}s..." >&2
+      sleep "$delay"
+    fi
+  done
+  echo "ERROR: type generation failed after 4 attempts." >&2
+  echo "Last stdout (first 20 lines):" >&2
+  head -20 "$target" >&2 || true
+  echo "Last stderr (last 10 lines):" >&2
+  tail -10 "$target.err" >&2 || true
+  rm -f "$target.err"
+  return 1
 }
 
 if [[ "${1:-}" == "--check" ]]; then
   TMP="$(mktemp)"
-  trap 'rm -f "$TMP"' EXIT
-  { printf '%s\n' "$HEADER"; generate; } > "$TMP"
-  validate_generated "$TMP"
+  trap 'rm -f "$TMP" "$TMP.err"' EXIT
+  generate_with_retry "$TMP"
   pnpm exec prettier --write "$TMP" --parser typescript >/dev/null
   if ! diff -q "$OUT" "$TMP" >/dev/null; then
     echo "ERROR: $OUT is stale. Run: DB_URL=... pnpm gen:types" >&2
@@ -74,9 +96,8 @@ if [[ "${1:-}" == "--check" ]]; then
   echo "Generated types are current."
 else
   TMP="$(mktemp)"
-  trap 'rm -f "$TMP"' EXIT
-  { printf '%s\n' "$HEADER"; generate; } > "$TMP"
-  validate_generated "$TMP"
+  trap 'rm -f "$TMP" "$TMP.err"' EXIT
+  generate_with_retry "$TMP"
   cat "$TMP" > "$OUT"
   pnpm exec prettier --write "$OUT" >/dev/null
   echo "Wrote $OUT"

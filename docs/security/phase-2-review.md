@@ -36,8 +36,9 @@ Controls:
 - Tests exercise these paths as PostgREST would execute them: as the
   `anon`/`authenticated` roles with `request.jwt.claims` set. This matches
   PostgREST's execution model; testing through an actual PostgREST instance
-  requires the full Supabase stack and is a recorded backlog item (this
-  environment cannot run Docker).
+  requires running the full Supabase stack (`supabase start`) and is a
+  recorded backlog item — CI uses Docker only for type generation
+  (postgres-meta), not for a full-stack run.
 
 ## Storage threat model
 
@@ -129,7 +130,7 @@ which remains the actual containment mechanism for rendered e-mail HTML.
    styles and contained by the sandboxed preview.
 2. RLS/PostgREST behavior is tested via role + `request.jwt.claims`
    emulation on vanilla PostgreSQL; a full-stack `supabase start` test run
-   should be added when a Docker-capable environment is available.
+   in CI (which already has Docker) is a follow-up item.
 3. The moderate `postcss <8.5.10` advisory (transitive via Next.js) remains
    below the high/critical gate and is tracked until Next bumps it.
 4. Attachment `sha256` is optional in Phase 2 (client-supplied when present);
