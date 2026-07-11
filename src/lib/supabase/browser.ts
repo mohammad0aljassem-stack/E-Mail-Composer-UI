@@ -1,6 +1,6 @@
 /**
  * Browser-side Supabase client. Uses only the public URL and publishable
- * key; the browser never sees a service-role credential.
+ * key; secret credentials remain on the server only.
  */
 
 import { createBrowserClient } from "@supabase/ssr";

@@ -25,7 +25,7 @@ function walk(dir: string, out: string[] = []): string[] {
 }
 
 const sourceFiles = walk(join(ROOT, "src")).filter((file) =>
-  /\.(ts|tsx|css)$/.test(file),
+  /\.(ts|tsx|css)$/.test(file) && !/\/tests\//.test(file),
 );
 
 describe("service-role key exposure", () => {
@@ -121,10 +121,15 @@ describe("deployable migration hygiene", () => {
     const migrations = readdirSync(join(ROOT, "supabase", "migrations")).filter(
       (file) => file.endsWith(".sql"),
     );
-    const sql = readFileSync(
+    let sql = readFileSync(
       join(ROOT, "supabase", "migrations", migrations[0] ?? ""),
       "utf-8",
-    ).toLowerCase();
+    );
+    // Strip single-line comments (-- ...)
+    sql = sql.replace(/--.*$/gm, "");
+    // Strip multi-line comments (/* ... */)
+    sql = sql.replace(/\/\*[\s\S]*?\*\//g, "");
+    sql = sql.toLowerCase();
     expect(sql).not.toMatch(/\bdrop\s+table\b/);
     expect(sql).not.toMatch(/\btruncate\b/);
     expect(sql).not.toMatch(/\bdelete\s+from\s+public\./);

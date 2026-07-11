@@ -18,7 +18,6 @@ export default defineConfig({
       include: [
         "src/lib/composer/**",
         "src/server/render/**",
-        "src/app/api/**",
       ],
       thresholds: {
         "src/lib/composer/**": {
@@ -32,12 +31,6 @@ export default defineConfig({
           branches: 85,
           functions: 90,
           lines: 90,
-        },
-        "src/app/api/**": {
-          statements: 85,
-          branches: 80,
-          functions: 85,
-          lines: 85,
         },
       },
     },

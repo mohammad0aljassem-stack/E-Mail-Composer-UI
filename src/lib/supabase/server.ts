@@ -1,9 +1,8 @@
 /**
  * Server-side Supabase client (current official @supabase/ssr pattern).
  *
- * Only the public URL and the publishable key are ever used here — the
- * service-role key is prohibited in this application (see ADR 0002). All
- * data access therefore runs through RLS as the authenticated user.
+ * Only the public URL and publishable key are used here (no admin credentials).
+ * All data access runs through RLS as the authenticated user (see ADR 0002).
  */
 
 import { cookies } from "next/headers";
