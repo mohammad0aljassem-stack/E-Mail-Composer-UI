@@ -20,6 +20,8 @@ this repository.
 | `@tiptap/extension-link`  | 2.27.2  | MIT     |
 | `@react-email/components` | 1.0.12  | MIT     |
 | `@react-email/render`     | 2.1.0   | MIT     |
+| `@supabase/ssr`           | 0.12.0  | MIT     |
+| `@supabase/supabase-js`   | 2.110.2 | MIT     |
 | `sanitize-html`           | 2.17.6  | MIT     |
 
 ## Development dependencies
@@ -35,6 +37,7 @@ this repository.
 | `@vitejs/plugin-react`   | 6.0.3   | MIT        |
 | `@testing-library/react` | 16.3.2  | MIT        |
 | `jsdom`                  | 29.1.1  | MIT        |
+| `supabase` (CLI)         | 2.109.1 | MIT        |
 | `@types/node`            | 22.20.1 | MIT        |
 | `@types/react`           | 19.2.17 | MIT        |
 | `@types/react-dom`       | 19.2.3  | MIT        |

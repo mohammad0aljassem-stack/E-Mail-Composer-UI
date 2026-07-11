@@ -1,8 +1,9 @@
 /**
  * Development preview endpoint: canonical JSON in, { html, text } out.
  *
- * - JSON only (Content-Type is enforced);
- * - bounded body size;
+ * - JSON only (Content-Type enforced);
+ * - bounded, streaming body read (stops as soon as the limit is exceeded —
+ *   see src/lib/http/body.ts);
  * - strict canonical validation before rendering;
  * - structured errors, never stack traces;
  * - no logging of message content;
@@ -11,6 +12,7 @@
 
 import { renderDraft } from "@/server/render/renderDraft";
 import { validateDraftDocument } from "@/lib/composer/canonical";
+import { readJsonBodyWithLimit } from "@/lib/http/body";
 
 export const runtime = "nodejs";
 
@@ -46,53 +48,11 @@ export async function POST(request: Request): Promise<Response> {
     return errorResponse(404, "not_found", "Not found.");
   }
 
-  const contentType = request.headers.get("content-type") ?? "";
-  if (!contentType.toLowerCase().includes("application/json")) {
-    return errorResponse(
-      415,
-      "unsupported_media_type",
-      "Content-Type must be application/json.",
-    );
+  const body = await readJsonBodyWithLimit(request, MAX_BODY_BYTES);
+  if (!body.ok) {
+    return errorResponse(body.status, body.code, body.message);
   }
-
-  const declaredLength = Number(request.headers.get("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) {
-    return errorResponse(
-      413,
-      "payload_too_large",
-      `Request body must not exceed ${MAX_BODY_BYTES} bytes.`,
-    );
-  }
-
-  let raw: string;
-  try {
-    raw = await request.text();
-  } catch {
-    return errorResponse(
-      400,
-      "invalid_body",
-      "Request body could not be read.",
-    );
-  }
-
-  if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) {
-    return errorResponse(
-      413,
-      "payload_too_large",
-      `Request body must not exceed ${MAX_BODY_BYTES} bytes.`,
-    );
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return errorResponse(
-      400,
-      "invalid_json",
-      "Request body is not valid JSON.",
-    );
-  }
+  const parsed = body.value;
 
   if (
     typeof parsed !== "object" ||

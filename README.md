@@ -1,12 +1,16 @@
 # Email Composer UI
 
-Phase 1 of the Email Composer: a professional e-mail editor whose **only**
-editable source of truth is Tiptap / ProseMirror JSON. Safe, e-mail-compatible
-HTML and a plain-text alternative are **derived** on the server from that
+The Email Composer: a professional e-mail editor whose **only** editable
+source of truth is Tiptap / ProseMirror JSON. Safe, e-mail-compatible HTML
+and a plain-text alternative are **derived** on the server from that
 canonical JSON — user-provided HTML is never stored or rendered directly.
 
-This repository contains the isolated composer foundation only. See
-[Excluded features](#excluded-features) for what is deliberately out of scope.
+Phase 1 delivered the isolated composer foundation; Phase 2 adds the
+Supabase-backed draft lifecycle: persisted drafts with debounced autosave,
+optimistic concurrency with visible conflict handling, immutable version
+history and restore, workspace templates with deterministic variables,
+personal signatures, and private verified attachments. See
+[Excluded features](#excluded-features) for what remains out of scope.
 
 ## Scope
 
@@ -59,22 +63,94 @@ Coverage thresholds are enforced for the critical modules: canonical
 validation, link safety, plain-text generation, server rendering, and the
 render API.
 
-## Feature flag
+## Feature flags
 
-The composer v1 surface (the `/composer-lab` page and the
-`/api/composer/render` endpoint) is gated behind a single environment
-variable:
+`.env.example` is **fail-closed**: every feature flag defaults to disabled.
+To develop locally, copy it and enable what you need:
+
+```bash
+cp .env.example .env.local
+# then set in .env.local:
+NEXT_PUBLIC_COMPOSER_V1_ENABLED=true          # /composer-lab + /api/composer/render
+NEXT_PUBLIC_DRAFT_LIFECYCLE_V1_ENABLED=true   # /w/[workspaceId]/drafts + /api/workspaces/**
+```
+
+Any other value (or unset) disables the surface: pages show a disabled
+notice and the APIs return `404`. The flags are the **rollback switches** —
+disabling them fully turns off the features without a code revert (see the
+ADRs).
+
+## Supabase setup (Phase 2)
+
+Persisted drafts require a Supabase project (Auth + Postgres + Storage).
+Only **public** values are configured in the app:
 
 ```
-NEXT_PUBLIC_COMPOSER_V1_ENABLED=true
+NEXT_PUBLIC_SUPABASE_URL=https://YOUR-PROJECT-ref.supabase.co
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_...
 ```
 
-- Set it to `true` to enable the feature.
-- Any other value (or unset) disables the page and makes the API return `404`.
+Never add a service-role or secret key to this application — the UI runs
+entirely as the authenticated user through RLS. All persisted draft pages
+and `/api/workspaces/**` routes require a valid Supabase Auth session
+(unauthenticated calls get `401`); configuring an auth provider and sign-in
+UX is outside this repository's scope.
 
-This flag is the **rollback switch**: setting it to `false` fully disables the
-new surface without reverting code. See
-[`docs/adr/0001-canonical-composer.md`](docs/adr/0001-canonical-composer.md).
+### Local database, baseline, and the Phase 2 migration
+
+The repo does not contain the historical migrations that created the
+production core schema. Instead:
+
+- `supabase/baseline/production_schema_2026_07_11.sql` — a **non-deployable**
+  snapshot of the current production schema (test scaffolding only; see
+  `supabase/baseline/README.md` for its checksum and provenance);
+- `supabase/migrations/20260711130000_draft_lifecycle.sql` — the **only
+  deployable** artifact of Phase 2 (additive).
+
+Run the database + RLS test suite against an isolated local PostgreSQL
+(no Docker required, PostgreSQL 16 binaries needed):
+
+```bash
+pnpm test:db          # throwaway cluster: baseline -> migration -> SQL tests
+pnpm gen:types        # regenerate src/lib/supabase/database.types.ts
+                      # (needs DB_URL; see scripts/gen-types.sh)
+```
+
+CI runs the same suite in an isolated job and fails if the committed
+generated types drift from the migrated schema. **The production migration
+is never applied automatically** — production deployment is a separate,
+explicitly approved operational step (see
+`docs/security/phase-2-review.md`).
+
+## Draft lifecycle (Phase 2)
+
+- Routes: `/w/[workspaceId]/drafts` (list + create) and
+  `/w/[workspaceId]/drafts/[draftId]` (editor).
+- **Autosave**: debounced (~1.5 s), no save per keystroke, skipped when the
+  content is unchanged; explicit actions flush pending saves; stale requests
+  are cancelled. Save state is always visible: Unsaved / Saving / Saved /
+  Offline / Conflict / Save failed.
+- **Conflicts**: every save carries the expected revision; a mismatch is
+  HTTP 409 and surfaces a visible conflict dialog with only safe choices —
+  reload the remote version, save your editor content as a new draft, or
+  compare metadata. There is no silent overwrite.
+- **Version history**: immutable checkpoints (initial, autosave checkpoints
+  at most every 10 minutes, manual, before/after template and signature,
+  restore). Restoring copies a historical snapshot into the current draft as
+  a **new** revision — history is never rewritten.
+- **Templates**: workspace-shared with immutable versions; bodies may
+  contain `variable` nodes and subjects `{{key}}` placeholders. Application
+  requires explicit values for all required variables (missing values block
+  with a structured list — nothing is ever guessed) and records the exact
+  template version used.
+- **Signatures**: personal per user and workspace (invisible to peers), at
+  most one default each, deterministic duplicate-safe application.
+- **Attachments**: private Supabase Storage bucket `draft-attachments`
+  (never public). Lifecycle: pending intent → authenticated upload to a
+  server-authorized path → verified finalization (object existence + size
+  checked) → `ready`. Only `ready` attachments appear in previews and the
+  future MIME manifest; deletion removes the object first. Limits: pdf, png,
+  jpeg, txt only; 10 MiB/file; 10 files and 25 MiB per draft.
 
 ## Canonical document design
 
