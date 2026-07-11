@@ -15,7 +15,10 @@ function jsonRequest(body: BodyInit, contentType = "application/json") {
   });
 }
 
-function chunkedRequest(chunks: Uint8Array[], contentType = "application/json") {
+function chunkedRequest(
+  chunks: Uint8Array[],
+  contentType = "application/json",
+) {
   let index = 0;
   const stream = new ReadableStream<Uint8Array>({
     pull(controller) {

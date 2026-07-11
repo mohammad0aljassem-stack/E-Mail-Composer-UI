@@ -1,5 +1,9 @@
 import { validateDraftDocument } from "@/lib/composer/canonical";
-import { RPC, type DraftRecord, type SaveDraftResult } from "@/lib/phase2/contracts";
+import {
+  RPC,
+  type DraftRecord,
+  type SaveDraftResult,
+} from "@/lib/phase2/contracts";
 import {
   guardRequest,
   isUuid,

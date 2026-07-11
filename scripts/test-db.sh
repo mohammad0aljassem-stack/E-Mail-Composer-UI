@@ -13,7 +13,7 @@
 #   bash scripts/test-db.sh --keep > /tmp/db.txt
 #   DB_URL=$(grep postgresql /tmp/db.txt | grep -oE 'postgresql://[^ ]+' | tail -1)
 #   DB_URL="$DB_URL" bash scripts/gen-types.sh --check
-set -euo pipefail
+set -eu
 
 cd "$(dirname "$0")/.."
 
@@ -25,7 +25,6 @@ PSQL_ARGS=(-U postgres -p "$PORT" -h localhost)
 # Cleanup function (trap-safe)
 cleanup() {
   if [[ "$KEEP" != "--keep" && -d "$DATA_DIR" ]]; then
-    echo "Stopping PostgreSQL cluster..."
     pg_ctl -D "$DATA_DIR" stop -m fast 2>/dev/null || true
     rm -rf "$DATA_DIR"
   fi
@@ -41,13 +40,20 @@ check_existing() {
 init_db() {
   echo "Initializing PostgreSQL 16 cluster at port $PORT..."
   mkdir -p "$DATA_DIR"
-  initdb -D "$DATA_DIR" -A trust -U postgres >/dev/null 2>&1
+  if ! initdb -D "$DATA_DIR" -A trust -U postgres >/dev/null 2>&1; then
+    echo "ERROR: initdb failed. Check /tmp for existing PG processes or permission issues." >&2
+    exit 1
+  fi
 }
 
 # Start PostgreSQL server
 start_db() {
   echo "Starting PostgreSQL server on port $PORT..."
-  pg_ctl -D "$DATA_DIR" start -w -l "$DATA_DIR/pg.log" -o "-p $PORT" >/dev/null 2>&1
+  if ! pg_ctl -D "$DATA_DIR" start -w -l "$DATA_DIR/pg.log" -o "-p $PORT" 2>&1 | grep -q "done"; then
+    echo "ERROR: pg_ctl start failed. Log:" >&2
+    tail -20 "$DATA_DIR/pg.log" 2>/dev/null || echo "  (log file not found)"
+    exit 1
+  fi
 }
 
 # Wait for PostgreSQL to be ready

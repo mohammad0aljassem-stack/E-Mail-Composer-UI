@@ -37,8 +37,7 @@ export async function POST(
   if (!body.ok) return body.response;
   const payload = body.value as { sha256?: unknown };
   const sha256 =
-    typeof payload.sha256 === "string" &&
-    /^[a-f0-9]{64}$/.test(payload.sha256)
+    typeof payload.sha256 === "string" && /^[a-f0-9]{64}$/.test(payload.sha256)
       ? payload.sha256
       : null;
 

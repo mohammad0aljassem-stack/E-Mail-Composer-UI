@@ -54,7 +54,10 @@ describe("service-role key exposure", () => {
 describe("forbidden dependencies", () => {
   const packageJson = JSON.parse(
     readFileSync(join(ROOT, "package.json"), "utf-8"),
-  ) as { dependencies: Record<string, string>; devDependencies: Record<string, string> };
+  ) as {
+    dependencies: Record<string, string>;
+    devDependencies: Record<string, string>;
+  };
   const allDeps = Object.keys({
     ...packageJson.dependencies,
     ...packageJson.devDependencies,

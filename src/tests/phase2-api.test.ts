@@ -18,7 +18,10 @@ vi.mock("@/lib/supabase/auth", () => ({
   requireAuthenticatedUser: vi.fn(async () => authState.result),
 }));
 
-import { GET as listDrafts, POST as createDraft } from "@/app/api/workspaces/[workspaceId]/drafts/route";
+import {
+  GET as listDrafts,
+  POST as createDraft,
+} from "@/app/api/workspaces/[workspaceId]/drafts/route";
 import { PATCH as saveDraft } from "@/app/api/workspaces/[workspaceId]/drafts/[draftId]/route";
 import { createSampleDraftDocument } from "@/lib/composer/samples";
 
@@ -36,7 +39,14 @@ function makeSupabaseMock(overrides: {
   const terminal = overrides.selectResult ?? { data: [], error: null };
   const chain: Record<string, unknown> = {};
   const passthrough = () => chain;
-  for (const method of ["select", "eq", "order", "insert", "update", "delete"]) {
+  for (const method of [
+    "select",
+    "eq",
+    "order",
+    "insert",
+    "update",
+    "delete",
+  ]) {
     chain[method] = vi.fn(passthrough);
   }
   chain.maybeSingle = vi.fn(async () => terminal);
@@ -171,7 +181,10 @@ describe("Phase 2 API guard behavior", () => {
   it("rejects invalid canonical documents with 422", async () => {
     authState.result = authed(makeSupabaseMock({}));
     const response = await createDraft(
-      jsonRequest({ subject: "x", document: { type: "doc", content: [{ type: "image" }] } }),
+      jsonRequest({
+        subject: "x",
+        document: { type: "doc", content: [{ type: "image" }] },
+      }),
       params({ workspaceId: WS }),
     );
     expect(response.status).toBe(422);

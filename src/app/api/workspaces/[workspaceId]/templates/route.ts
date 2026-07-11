@@ -69,12 +69,9 @@ export async function POST(
     typeof payload.subjectTemplate === "string" ? payload.subjectTemplate : "";
   const subjectParse = parseSubjectTemplate(subjectTemplate);
   if (!subjectParse.ok) {
-    return jsonError(
-      422,
-      "invalid_body",
-      "The subject template is invalid.",
-      { details: subjectParse.errors },
-    );
+    return jsonError(422, "invalid_body", "The subject template is invalid.", {
+      details: subjectParse.errors,
+    });
   }
   const templateValidation = validateTemplateDocument(payload.bodyTemplateJson);
   if (!templateValidation.ok) {

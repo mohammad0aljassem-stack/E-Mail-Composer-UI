@@ -56,8 +56,7 @@ export async function guardRequest(): Promise<GuardResult> {
 }
 
 export type ParsedBody =
-  | { ok: true; value: unknown }
-  | { ok: false; response: Response };
+  { ok: true; value: unknown } | { ok: false; response: Response };
 
 export async function parseJsonBody(request: Request): Promise<ParsedBody> {
   const result = await readJsonBodyWithLimit(request, API_MAX_JSON_BODY_BYTES);

@@ -69,7 +69,10 @@ export async function POST(
     p_body_json: validation.document,
   });
   if (error) return mapDatabaseError(error);
-  return Response.json({ draft: data as unknown as DraftRecord }, {
-    status: 201,
-  });
+  return Response.json(
+    { draft: data as unknown as DraftRecord },
+    {
+      status: 201,
+    },
+  );
 }
