@@ -93,7 +93,9 @@ export function DraftList({ workspaceId }: DraftListProps) {
     async (draft: DraftRecord) => {
       setActionError(null);
       try {
-        await archiveDraft(workspaceId, draft.id);
+        await archiveDraft(workspaceId, draft.id, {
+          expectedRevision: draft.revision,
+        });
         await loadDrafts();
       } catch {
         setActionError("Archiving the draft failed.");

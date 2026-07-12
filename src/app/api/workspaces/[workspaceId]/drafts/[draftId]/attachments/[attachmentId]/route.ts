@@ -66,6 +66,7 @@ export async function DELETE(
 
   const { error: markError } = await supabase.rpc(RPC.markAttachmentDeleted, {
     p_attachment_id: attachmentId,
+    p_workspace_id: workspaceId,
   });
   if (markError) return mapDatabaseError(markError);
 

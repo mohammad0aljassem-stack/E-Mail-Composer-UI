@@ -94,6 +94,13 @@ export function mapDatabaseError(error: PostgrestErrorLike): Response {
   if (error.code === "PGRST116") {
     return jsonError(404, "not_found", "Not found.");
   }
+  // Our RPCs RAISE P0002 for not-found / access-denied (e.g. a draft or
+  // workspace the caller cannot see). Map it to a uniform 404 that never
+  // distinguishes "does not exist" from "not yours" — must come before the
+  // generic P0 → 422 branch below.
+  if (error.code === "P0002") {
+    return jsonError(404, "not_found", "Not found.");
+  }
   // Raised business-rule errors from our RPCs (P0001 and friends) carry a
   // human-readable, content-free message.
   if (error.code?.startsWith("P0") && error.message) {

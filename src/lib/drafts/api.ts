@@ -180,10 +180,12 @@ export async function saveDraft(
 export async function archiveDraft(
   workspaceId: string,
   draftId: string,
+  input: { expectedRevision: number },
   options: RequestOptions = {},
 ): Promise<{ archived: true }> {
   return request<{ archived: true }>(draftUrl(workspaceId, draftId), {
     method: "DELETE",
+    body: { expectedRevision: input.expectedRevision },
     signal: options.signal,
   });
 }

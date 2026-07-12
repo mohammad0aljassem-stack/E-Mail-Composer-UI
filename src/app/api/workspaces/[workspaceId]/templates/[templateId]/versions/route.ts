@@ -99,6 +99,7 @@ export async function POST(
     RPC.createTemplateVersion,
     {
       p_template_id: templateId,
+      p_workspace_id: workspaceId,
       p_subject_template: subjectTemplate,
       p_body_template_json: toDbJson(templateValidation.document),
       p_variable_schema: toDbJson(schemaValidation.variables),

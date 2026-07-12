@@ -106,6 +106,7 @@ export async function PATCH(
 
   const { data, error } = await guard.context.supabase.rpc(RPC.saveDraft, {
     p_draft_id: draftId,
+    p_workspace_id: workspaceId,
     p_expected_revision: payload.expectedRevision,
     p_subject: subject,
     p_body_json: toDbJson(validation.document),
@@ -116,7 +117,7 @@ export async function PATCH(
 }
 
 export async function DELETE(
-  _request: Request,
+  request: Request,
   { params }: RouteParams,
 ): Promise<Response> {
   const guard = await guardRequest();
@@ -126,18 +127,24 @@ export async function DELETE(
     return jsonError(404, "not_found", "Not found.");
   }
 
-  const { data, error } = await guard.context.supabase
-    .from("drafts")
-    .update({
-      status: "archived",
-      archived_at: new Date().toISOString(),
-      updated_by: guard.context.userId,
-    })
-    .eq("id", draftId)
-    .eq("workspace_id", workspaceId)
-    .select("id")
-    .maybeSingle();
+  const body = await parseJsonBody(request);
+  if (!body.ok) return body.response;
+  const payload = body.value as { expectedRevision?: unknown };
+  if (
+    typeof payload.expectedRevision !== "number" ||
+    !Number.isSafeInteger(payload.expectedRevision) ||
+    payload.expectedRevision < 1
+  ) {
+    return jsonError(422, "invalid_body", "expectedRevision is required.");
+  }
+
+  // drafts is SELECT-only for the authenticated role; archiving goes through
+  // the SECURITY DEFINER archive_draft RPC (optimistic-concurrency checked).
+  const { error } = await guard.context.supabase.rpc(RPC.archiveDraft, {
+    p_draft_id: draftId,
+    p_workspace_id: workspaceId,
+    p_expected_revision: payload.expectedRevision,
+  });
   if (error) return mapDatabaseError(error);
-  if (!data) return jsonError(404, "not_found", "Not found.");
   return Response.json({ archived: true });
 }

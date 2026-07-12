@@ -105,6 +105,7 @@ export async function POST(
     RPC.createAttachmentIntent,
     {
       p_draft_id: draftId,
+      p_workspace_id: workspaceId,
       p_original_filename: payload.originalFilename,
       p_mime_type: payload.mimeType.toLowerCase(),
       p_size_bytes: payload.sizeBytes,
