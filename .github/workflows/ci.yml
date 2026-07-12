@@ -53,12 +53,13 @@ jobs:
     name: Database migration and RLS tests
     runs-on: ubuntu-latest
     # Isolated local PostgreSQL only: loads the non-deployable baseline,
-    # applies the Phase 2 migration twice (idempotency), and runs the SQL
-    # and RLS test suites. Then regenerates database types from the
-    # post-migration schema with the official Supabase CLI (which runs
-    # postgres-meta in Docker) and fails on any byte-level drift from the
-    # committed src/lib/supabase/database.types.ts. Never connects to
-    # production; no secrets.
+    # applies the full migration chain (Phase 2 draft-lifecycle + Phase 2
+    # hardening + Phase 3A transport), re-applying each for idempotency, and
+    # runs every SQL/RLS suite plus the Phase 2 equivalence check. Then
+    # regenerates database types from the post-migration schema with the
+    # official Supabase CLI (which runs postgres-meta in Docker) and fails on
+    # any byte-level drift from the committed src/lib/supabase/database.types.ts.
+    # Never connects to production; no secrets.
     steps:
       - name: Checkout
         uses: actions/checkout@v4

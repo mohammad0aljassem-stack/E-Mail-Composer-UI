@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Phase 2 database + RLS test runner.
+# Phase 2 + Phase 3A database + RLS test runner.
 #
 # Starts a throwaway PostgreSQL 16 cluster on port 54329 (or reuses an existing
-# one if running), applies the baseline schema + Phase 2 migration, runs all
-# SQL test suites, and exits non-zero if any test fails.
+# one if running), applies the baseline schema + the full migration chain
+# (Phase 2 draft-lifecycle + Phase 2 hardening + Phase 3A transport), re-applies
+# each migration to prove idempotency, runs all SQL test suites, and exits
+# non-zero if any test fails.
 #
 # Usage:
 #   bash scripts/test-db.sh           # run tests and clean up
@@ -124,8 +126,8 @@ run_test_suite() {
   echo "  $passed assertions passed"
 }
 
-echo "Phase 2 Database Test Runner"
-echo "============================"
+echo "Phase 2 + Phase 3A Database Test Runner"
+echo "======================================="
 
 if check_existing; then
   echo "Reusing PostgreSQL cluster already running on port $PORT."
@@ -139,6 +141,12 @@ apply_sql "Loading baseline schema" supabase/baseline/production_schema_2026_07_
 apply_sql "Applying Phase 2 migration" supabase/migrations/20260711130000_draft_lifecycle.sql
 # Idempotency: the migration must be safely re-runnable.
 apply_sql "Re-applying Phase 2 migration (idempotency check)" supabase/migrations/20260711130000_draft_lifecycle.sql
+# Phase 2 hardening migration (corrective + idempotent) — completes the chain.
+apply_sql "Applying Phase 2 hardening migration" supabase/migrations/20260712100000_enforce_phase2_rpc_invariants.sql
+apply_sql "Re-applying Phase 2 hardening migration (idempotency check)" supabase/migrations/20260712100000_enforce_phase2_rpc_invariants.sql
+# Phase 3A transport foundation — additive on top of the Phase 2 chain.
+apply_sql "Applying Phase 3A transport migration" supabase/migrations/20260713100000_transport_foundation.sql
+apply_sql "Re-applying Phase 3A transport migration (idempotency check)" supabase/migrations/20260713100000_transport_foundation.sql
 
 test_dir="supabase/tests/database"
 if [[ ! -d "$test_dir" ]]; then
