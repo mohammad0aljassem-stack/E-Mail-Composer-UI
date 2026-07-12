@@ -108,30 +108,38 @@ describe("deployable migration hygiene", () => {
     expect(baseline.join(",")).toContain("production_schema_2026_07_11.sql");
   });
 
-  it("the Phase 2 migration is newer than the last production migration", () => {
+  it("every Phase 2 migration is newer than the last production migration", () => {
     const migrations = readdirSync(join(ROOT, "supabase", "migrations")).filter(
       (file) => file.endsWith(".sql"),
     );
-    expect(migrations.length).toBe(1);
-    const version = migrations[0]?.split("_")[0] ?? "0";
-    expect(Number(version)).toBeGreaterThan(20260709182252);
+    // Phase 2 ships the draft-lifecycle migration plus the RPC-invariant
+    // hardening migration; both must sort after the production tip.
+    expect(migrations.length).toBe(2);
+    for (const file of migrations) {
+      const version = file.split("_")[0] ?? "0";
+      expect(Number(version)).toBeGreaterThan(20260709182252);
+    }
   });
 
-  it("the migration contains no destructive statements", () => {
+  it("no migration contains destructive statements", () => {
     const migrations = readdirSync(join(ROOT, "supabase", "migrations")).filter(
       (file) => file.endsWith(".sql"),
     );
-    let sql = readFileSync(
-      join(ROOT, "supabase", "migrations", migrations[0] ?? ""),
-      "utf-8",
-    );
-    // Strip single-line comments (-- ...)
-    sql = sql.replace(/--.*$/gm, "");
-    // Strip multi-line comments (/* ... */)
-    sql = sql.replace(/\/\*[\s\S]*?\*\//g, "");
-    sql = sql.toLowerCase();
-    expect(sql).not.toMatch(/\bdrop\s+table\b/);
-    expect(sql).not.toMatch(/\btruncate\b/);
-    expect(sql).not.toMatch(/\bdelete\s+from\s+public\./);
+    for (const file of migrations) {
+      let sql = readFileSync(
+        join(ROOT, "supabase", "migrations", file),
+        "utf-8",
+      );
+      // Strip single-line comments (-- ...)
+      sql = sql.replace(/--.*$/gm, "");
+      // Strip multi-line comments (/* ... */)
+      sql = sql.replace(/\/\*[\s\S]*?\*\//g, "");
+      sql = sql.toLowerCase();
+      // DROP POLICY / DROP FUNCTION / REVOKE are legitimate hardening tools;
+      // only data-destroying statements are forbidden.
+      expect(sql, file).not.toMatch(/\bdrop\s+table\b/);
+      expect(sql, file).not.toMatch(/\btruncate\b/);
+      expect(sql, file).not.toMatch(/\bdelete\s+from\s+public\./);
+    }
   });
 });
