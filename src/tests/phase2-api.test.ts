@@ -23,11 +23,14 @@ import {
   POST as createDraft,
 } from "@/app/api/workspaces/[workspaceId]/drafts/route";
 import { PATCH as saveDraft } from "@/app/api/workspaces/[workspaceId]/drafts/[draftId]/route";
+import { POST as applyTemplate } from "@/app/api/workspaces/[workspaceId]/templates/[templateId]/apply/route";
 import { createSampleDraftDocument } from "@/lib/composer/samples";
 
 const WS = "11111111-1111-4111-8111-111111111111";
 const DRAFT = "22222222-2222-4222-8222-222222222222";
 const USER = "33333333-3333-4333-8333-333333333333";
+const TEMPLATE = "44444444-4444-4444-8444-444444444444";
+const TEMPLATE_VERSION = "55555555-5555-4555-8555-555555555555";
 
 type QueryResult = { data: unknown; error: unknown };
 
@@ -133,6 +136,10 @@ describe("Phase 2 API guard behavior", () => {
         selectResult: { data: { id: DRAFT }, error: null },
         rpcResult: {
           data: null,
+          // The hardened save_draft RPC RAISES P0409 with a
+          // `hint = 'current_revision=N'` payload on optimistic-concurrency
+          // mismatch; this is the real DB behavior, mirrored here in a mocked
+          // PostgREST error (7 is a representative stored revision).
           error: {
             code: "P0409",
             message: "revision conflict",
@@ -176,6 +183,69 @@ describe("Phase 2 API guard behavior", () => {
     // No existence signal, no stack trace, no internals.
     expect(raw).not.toContain("stack");
     expect(raw).not.toMatch(/\n\s+at /);
+  });
+
+  it("maps an RPC P0002 (not-found/access-denied) to a uniform 404 on create_draft", async () => {
+    // create_draft is SECURITY DEFINER and RAISES P0002 when the caller is not
+    // a member of the target workspace. That must surface as a uniform 404,
+    // never a 422, so cross-workspace existence never leaks.
+    authState.result = authed(
+      makeSupabaseMock({
+        rpcResult: {
+          data: null,
+          error: { code: "P0002", message: "not found or access denied" },
+        },
+      }),
+    );
+    const response = await createDraft(
+      jsonRequest({ subject: "x", document: createSampleDraftDocument() }),
+      params({ workspaceId: WS }),
+    );
+    expect(response.status).toBe(404);
+    const body = (await response.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("not_found");
+  });
+
+  it("maps a checkpoint P0002 to a uniform 404 on templates/apply", async () => {
+    const version = {
+      id: TEMPLATE_VERSION,
+      workspace_id: WS,
+      template_id: TEMPLATE,
+      version_no: 1,
+      subject_template: "Hallo",
+      body_template_json: {
+        type: "doc",
+        content: [
+          { type: "paragraph", content: [{ type: "text", text: "Hallo" }] },
+        ],
+      },
+      variable_schema: [],
+      created_by: USER,
+      created_at: "2026-01-01T00:00:00.000Z",
+    };
+    authState.result = authed(
+      makeSupabaseMock({
+        selectResult: { data: version, error: null },
+        // checkpoint_draft (first RPC) RAISES P0002 for a draft the caller
+        // cannot see across workspaces.
+        rpcResult: {
+          data: null,
+          error: { code: "P0002", message: "not found or access denied" },
+        },
+      }),
+    );
+    const response = await applyTemplate(
+      jsonRequest({
+        templateVersionId: TEMPLATE_VERSION,
+        draftId: DRAFT,
+        expectedRevision: 1,
+        values: {},
+      }),
+      params({ workspaceId: WS, templateId: TEMPLATE }),
+    );
+    expect(response.status).toBe(404);
+    const body = (await response.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("not_found");
   });
 
   it("rejects invalid canonical documents with 422", async () => {
