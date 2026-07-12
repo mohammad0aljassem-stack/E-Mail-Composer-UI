@@ -900,11 +900,20 @@ export type Database = {
       [_ in never]: never;
     };
     Functions: {
+      archive_draft: {
+        Args: {
+          p_draft_id: string;
+          p_expected_revision: number;
+          p_workspace_id: string;
+        };
+        Returns: Json;
+      };
       checkpoint_draft: {
         Args: {
           p_draft_id: string;
           p_expected_revision: number;
           p_reason: string;
+          p_workspace_id: string;
         };
         Returns: Json;
       };
@@ -913,7 +922,9 @@ export type Database = {
           p_draft_id: string;
           p_mime_type: string;
           p_original_filename: string;
+          p_sha256?: string;
           p_size_bytes: number;
+          p_workspace_id: string;
         };
         Returns: {
           created_at: string;
@@ -970,6 +981,7 @@ export type Database = {
           p_subject_template: string;
           p_template_id: string;
           p_variable_schema: Json;
+          p_workspace_id: string;
         };
         Returns: {
           body_template_json: Json;
@@ -990,7 +1002,11 @@ export type Database = {
         };
       };
       finalize_attachment: {
-        Args: { p_attachment_id: string; p_sha256?: string };
+        Args: {
+          p_attachment_id: string;
+          p_sha256?: string;
+          p_workspace_id: string;
+        };
         Returns: {
           created_at: string;
           created_by: string;
@@ -1024,7 +1040,12 @@ export type Database = {
         Returns: boolean;
       };
       mark_attachment_deleted: {
-        Args: { p_attachment_id: string };
+        Args: { p_attachment_id: string; p_workspace_id: string };
+        Returns: undefined;
+      };
+      phase2_safe_filename: { Args: { p_input: string }; Returns: string };
+      phase2_validate_variable_schema: {
+        Args: { p_schema: Json };
         Returns: undefined;
       };
       restore_draft_version: {
@@ -1032,6 +1053,7 @@ export type Database = {
           p_draft_id: string;
           p_expected_revision: number;
           p_version_id: string;
+          p_workspace_id: string;
         };
         Returns: Json;
       };
@@ -1040,8 +1062,11 @@ export type Database = {
           p_body_json: Json;
           p_draft_id: string;
           p_expected_revision: number;
+          p_last_signature_id?: string;
+          p_last_template_version_id?: string;
           p_save_reason: string;
           p_subject: string;
+          p_workspace_id: string;
         };
         Returns: Json;
       };
