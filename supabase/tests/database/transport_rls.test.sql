@@ -135,6 +135,8 @@ begin
 end $$;
 
 -- 1b. create_send_intent is idempotent on idempotency_key (returns same intent).
+--     Payload MUST be byte-identical to section 1's call — strict idempotency
+--     (Phase 3A hardening) raises P0409 on a divergent payload for the same key.
 do $$
 declare
   i public.send_intents;
@@ -147,7 +149,7 @@ begin
     'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
     'cccccccc-cccc-cccc-cccc-ccccccccccc1',
     v_draft, v_rev, 'ops@w1.example.com',
-    '{"to":["dest@example.com"]}'::jsonb, 'Hello', null, null, '[]'::jsonb,
+    '{"to":["dest@example.com"],"cc":[],"bcc":[]}'::jsonb, 'Hello', null, null, '[]'::jsonb,
     null, null, 1, 'idem-key-1');
   perform public.test_assert(i.id = v_intent, 'idempotent replay returns the original intent');
   select count(*) into n from public.send_intents where idempotency_key = 'idem-key-1';
@@ -335,7 +337,9 @@ do $$
 declare v jsonb; n int;
 begin
   v := public.request_mailbox_sync('cccccccc-cccc-cccc-cccc-ccccccccccc1', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
-  perform public.test_assert(v ->> 'status' = 'requested', 'request_mailbox_sync returns status=requested');
+  -- Phase 3A hardening: the RPC now returns the DURABLE request id/status.
+  perform public.test_assert(v ->> 'status' = 'pending', 'request_mailbox_sync returns durable status=pending');
+  perform public.test_assert(v ->> 'sync_request_id' is not null, 'request_mailbox_sync returns a durable sync_request_id');
   select count(*) into n from public.transport_audit
     where mailbox_id = 'cccccccc-cccc-cccc-cccc-ccccccccccc1' and event_type = 'mailbox_sync_requested';
   perform public.test_assert(n = 1, 'request_mailbox_sync appends a content-free audit event');

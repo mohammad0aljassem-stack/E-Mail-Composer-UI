@@ -147,6 +147,9 @@ apply_sql "Re-applying Phase 2 hardening migration (idempotency check)" supabase
 # Phase 3A transport foundation — additive on top of the Phase 2 chain.
 apply_sql "Applying Phase 3A transport migration" supabase/migrations/20260713100000_transport_foundation.sql
 apply_sql "Re-applying Phase 3A transport migration (idempotency check)" supabase/migrations/20260713100000_transport_foundation.sql
+# Phase 3A transport contract hardening — additive corrective on top of the above.
+apply_sql "Applying Phase 3A hardening migration" supabase/migrations/20260714100000_transport_contract_hardening.sql
+apply_sql "Re-applying Phase 3A hardening migration (idempotency check)" supabase/migrations/20260714100000_transport_contract_hardening.sql
 
 test_dir="supabase/tests/database"
 if [[ ! -d "$test_dir" ]]; then

@@ -1023,6 +1023,7 @@ export type Database = {
           mailbox_id: string;
           message_id: string;
           recipients: Json;
+          request_fingerprint: string | null;
           sender: string;
           signature_id: string | null;
           subject: string;
@@ -1045,6 +1046,7 @@ export type Database = {
           mailbox_id: string;
           message_id: string;
           recipients: Json;
+          request_fingerprint?: string | null;
           sender: string;
           signature_id?: string | null;
           subject?: string;
@@ -1067,6 +1069,7 @@ export type Database = {
           mailbox_id?: string;
           message_id?: string;
           recipients?: Json;
+          request_fingerprint?: string | null;
           sender?: string;
           signature_id?: string | null;
           subject?: string;
@@ -1514,6 +1517,7 @@ export type Database = {
           mailbox_id: string;
           message_id: string;
           recipients: Json;
+          request_fingerprint: string | null;
           sender: string;
           signature_id: string | null;
           subject: string;

@@ -26,7 +26,7 @@ begin
 end;
 $$;
 
--- 1. Table privilege matrix: 4 roles x 10 tables x 4 privileges = 160 assertions.
+-- 1. Table privilege matrix: 4 roles x 11 tables x 4 privileges = 176 assertions.
 do $$
 declare
   r record;
@@ -40,7 +40,8 @@ begin
       ('public','mailboxes'),('public','mailbox_folders'),('public','mail_messages'),
       ('public','draft_mirrors'),('public','send_intents'),('public','send_attempts'),
       ('public','transport_audit'),
-      ('transport','mailbox_credentials'),('transport','worker_claims'),('transport','worker_heartbeats')
+      ('transport','mailbox_credentials'),('transport','worker_claims'),('transport','worker_heartbeats'),
+      ('transport','sync_requests')
     ) t(sch, tbl)
     cross join (values ('SELECT'),('INSERT'),('UPDATE'),('DELETE')) privs(priv)
   loop
@@ -61,6 +62,8 @@ begin
           when r.sch = 'transport' and r.tbl = 'mailbox_credentials' then r.priv = 'SELECT'
           when r.sch = 'transport' and r.tbl = 'worker_claims'   then true
           when r.sch = 'transport' and r.tbl = 'worker_heartbeats' then true
+          -- sync_requests: worker claims (SELECT/UPDATE) only; the DEFINER RPC inserts.
+          when r.sch = 'transport' and r.tbl = 'sync_requests'   then r.priv in ('SELECT','UPDATE')
           else false
         end
     end;
