@@ -42,23 +42,23 @@ in `transport_rls.test.sql`).
 
 ### public (RLS on; members SELECT within their workspace)
 
-| Table | Purpose | Secrets? |
-|-------|---------|----------|
-| `mailboxes` | Mailbox metadata + non-secret IMAP/SMTP host/port/security config, `enabled`, `kill_switch` | No passwords |
-| `mailbox_folders` | Discovered folders + safe-to-expose sync cursors (uidvalidity/uidnext/last_seen_uid/highest_modseq) | No |
-| `mail_messages` | Synchronized message **METADATA ONLY** (headers/summary/flags/size); dedupe on `(folder_id, uidvalidity, uid)` | **No body/content, ever** |
-| `draft_mirrors` | Draft→remote IMAP mapping; idempotent on `(draft_id, mailbox_id)` | No |
-| `send_intents` | **Immutable** confirmed-send snapshot; unique `idempotency_key` | No (hashes only) |
-| `send_attempts` | Outbound state machine w/ compare-and-set `version` | No |
-| `transport_audit` | Content-free audit events (`event_type` + correlation/message ids + small non-content `detail`) | **No bodies** |
+| Table             | Purpose                                                                                                        | Secrets?                  |
+| ----------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| `mailboxes`       | Mailbox metadata + non-secret IMAP/SMTP host/port/security config, `enabled`, `kill_switch`                    | No passwords              |
+| `mailbox_folders` | Discovered folders + safe-to-expose sync cursors (uidvalidity/uidnext/last_seen_uid/highest_modseq)            | No                        |
+| `mail_messages`   | Synchronized message **METADATA ONLY** (headers/summary/flags/size); dedupe on `(folder_id, uidvalidity, uid)` | **No body/content, ever** |
+| `draft_mirrors`   | Draft→remote IMAP mapping; idempotent on `(draft_id, mailbox_id)`                                              | No                        |
+| `send_intents`    | **Immutable** confirmed-send snapshot; unique `idempotency_key`                                                | No (hashes only)          |
+| `send_attempts`   | Outbound state machine w/ compare-and-set `version`                                                            | No                        |
+| `transport_audit` | Content-free audit events (`event_type` + correlation/message ids + small non-content `detail`)                | **No bodies**             |
 
 ### transport (PRIVATE; no anon/authenticated access at all)
 
-| Table | Purpose |
-|-------|---------|
+| Table                 | Purpose                                                                                                                                      |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `mailbox_credentials` | AEAD ciphertext/nonce/auth_tag/algorithm/key_version + AAD binding; **no plaintext column**; one active (non-revoked) credential per mailbox |
-| `worker_claims` | Atomic per-`send_attempt` lease (worker_id, lease_until, heartbeat_at) for at-most-one-worker delivery |
-| `worker_heartbeats` | Worker liveness (worker_id/last_seen/state); **no message content** |
+| `worker_claims`       | Atomic per-`send_attempt` lease (worker_id, lease_until, heartbeat_at) for at-most-one-worker delivery                                       |
+| `worker_heartbeats`   | Worker liveness (worker_id/last_seen/state); **no message content**                                                                          |
 
 ## The worker-only decryption boundary
 
@@ -77,18 +77,18 @@ that the browser can call never read or return credential material.
 Roles: `anon`, `authenticated`, `service_role`, `transport_worker`.
 Privileges checked: SELECT / INSERT / UPDATE / DELETE.
 
-| Table (schema) | anon | authenticated | transport_worker | service_role |
-|----------------|------|---------------|------------------|--------------|
-| public.mailboxes | — | SELECT | SELECT | ALL |
-| public.mailbox_folders | — | SELECT | SELECT,INSERT,UPDATE,DELETE | ALL |
-| public.mail_messages | — | SELECT | SELECT,INSERT,UPDATE,DELETE | ALL |
-| public.draft_mirrors | — | SELECT | SELECT,INSERT,UPDATE,DELETE | ALL |
-| public.send_intents | — | SELECT | SELECT | ALL |
-| public.send_attempts | — | SELECT | SELECT,UPDATE | ALL |
-| public.transport_audit | — | SELECT | SELECT,INSERT | ALL |
-| transport.mailbox_credentials | — | **none** | SELECT | ALL |
-| transport.worker_claims | — | **none** | SELECT,INSERT,UPDATE,DELETE | ALL |
-| transport.worker_heartbeats | — | **none** | SELECT,INSERT,UPDATE,DELETE | ALL |
+| Table (schema)                | anon | authenticated | transport_worker            | service_role |
+| ----------------------------- | ---- | ------------- | --------------------------- | ------------ |
+| public.mailboxes              | —    | SELECT        | SELECT                      | ALL          |
+| public.mailbox_folders        | —    | SELECT        | SELECT,INSERT,UPDATE,DELETE | ALL          |
+| public.mail_messages          | —    | SELECT        | SELECT,INSERT,UPDATE,DELETE | ALL          |
+| public.draft_mirrors          | —    | SELECT        | SELECT,INSERT,UPDATE,DELETE | ALL          |
+| public.send_intents           | —    | SELECT        | SELECT                      | ALL          |
+| public.send_attempts          | —    | SELECT        | SELECT,UPDATE               | ALL          |
+| public.transport_audit        | —    | SELECT        | SELECT,INSERT               | ALL          |
+| transport.mailbox_credentials | —    | **none**      | SELECT                      | ALL          |
+| transport.worker_claims       | —    | **none**      | SELECT,INSERT,UPDATE,DELETE | ALL          |
+| transport.worker_heartbeats   | —    | **none**      | SELECT,INSERT,UPDATE,DELETE | ALL          |
 
 Schema `transport`: `USAGE` granted to `transport_worker` + `service_role`
 only; `anon`/`authenticated` have neither `USAGE` nor `CREATE`. Every grant uses

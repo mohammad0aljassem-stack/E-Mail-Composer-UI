@@ -108,13 +108,13 @@ describe("deployable migration hygiene", () => {
     expect(baseline.join(",")).toContain("production_schema_2026_07_11.sql");
   });
 
-  it("every Phase 2 migration is newer than the last production migration", () => {
+  it("every post-production migration is newer than the last production migration", () => {
     const migrations = readdirSync(join(ROOT, "supabase", "migrations")).filter(
       (file) => file.endsWith(".sql"),
     );
-    // Phase 2 ships the draft-lifecycle migration plus the RPC-invariant
-    // hardening migration; both must sort after the production tip.
-    expect(migrations.length).toBe(2);
+    // Phase 2 draft-lifecycle + Phase 2 RPC hardening + Phase 3A transport;
+    // all must sort after the production tip.
+    expect(migrations.length).toBe(3);
     for (const file of migrations) {
       const version = file.split("_")[0] ?? "0";
       expect(Number(version)).toBeGreaterThan(20260709182252);
