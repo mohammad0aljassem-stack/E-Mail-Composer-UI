@@ -96,26 +96,24 @@ export async function POST(
 
   const { error: checkpointError } = await supabase.rpc(RPC.checkpointDraft, {
     p_draft_id: draftId,
+    p_workspace_id: workspaceId,
     p_expected_revision: payload.expectedRevision,
     p_reason: "before_signature",
   });
   if (checkpointError) return mapDatabaseError(checkpointError);
 
+  // save_draft records the signature used via p_last_signature_id; drafts is
+  // SELECT-only so there is no direct trace UPDATE.
   const { data: saved, error: saveError } = await supabase.rpc(RPC.saveDraft, {
     p_draft_id: draftId,
+    p_workspace_id: workspaceId,
     p_expected_revision: payload.expectedRevision,
     p_subject: (draft as { subject: string }).subject,
     p_body_json: toDbJson(applied),
     p_save_reason: "after_signature",
+    p_last_signature_id: payload.signatureId,
   });
   if (saveError) return mapDatabaseError(saveError);
-
-  const { error: traceError } = await supabase
-    .from("drafts")
-    .update({ last_signature_id: payload.signatureId })
-    .eq("id", draftId)
-    .eq("workspace_id", workspaceId);
-  if (traceError) return mapDatabaseError(traceError);
 
   return Response.json({
     ...(saved as unknown as SaveDraftResult),

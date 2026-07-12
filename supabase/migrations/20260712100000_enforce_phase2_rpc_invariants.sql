@@ -1,476 +1,51 @@
 -- ============================================================================
--- Phase 2 — Draft lifecycle, versions, templates, signatures, attachments
--- Migration: 20260711130000_draft_lifecycle.sql
+-- Phase 2 hardening — enforce RPC-only invariants at the database layer
+-- Migration: 20260712100000_enforce_phase2_rpc_invariants.sql
 --
--- Strictly ADDITIVE on top of production migration 20260709182252. It only
--- creates new objects (tables, triggers, functions, policies, one storage
--- bucket row + storage policies) and never alters or drops existing ones.
--- Idempotency guards (IF NOT EXISTS / CREATE OR REPLACE / DROP POLICY IF
--- EXISTS / ON CONFLICT DO NOTHING / guarded DO blocks) make a re-run safe.
+-- CORRECTIVE, ADDITIVE and IDEMPOTENT. The original 20260711130000 migration
+-- granted authenticated direct INSERT/UPDATE/DELETE on drafts /
+-- draft_templates / signatures / draft_attachments (+ INSERT on the version
+-- tables) and shipped its mutation RPCs as SECURITY INVOKER, so any member
+-- could bypass every RPC-only invariant through direct PostgREST table DML.
 --
--- Canonical names, limits and error codes come from src/lib/phase2/contracts.ts:
---   bucket "draft-attachments", 10 MiB/file, 10 attachments/draft,
---   25 MiB/draft total, MIME allowlist (application/pdf, image/png,
---   image/jpeg, text/plain), revision-conflict SQLSTATE 'P0409'.
+-- This migration converts an environment that ran the ORIGINAL (insecure)
+-- 20260711130000 into the same secure state produced by the AMENDED
+-- 20260711130000:
+--   * mutation RPCs become SECURITY DEFINER (the only write path);
+--   * direct table privileges collapse to SELECT-only (+ the draft_templates /
+--     signatures exceptions);
+--   * the storage INSERT policy is re-scoped to a matching pending intent row.
 --
--- Error-code conventions used by the RPCs and integrity triggers:
---   P0409 revision conflict                 22023 invalid argument value
---   P0002 row not found / not accessible    54000 attachment count/size limit
---   42501 authentication required           55000 storage object precondition
---   23514 integrity-trigger violation (mirrors a CHECK violation)
+-- Convergence guarantee: baseline -> amended-20260711130000 and
+-- baseline -> original-20260711130000 -> this migration produce identical
+-- security-relevant schema. It is safe when the amended migration is already
+-- installed (it never weakens an already-secure definition) and is fully
+-- re-runnable (apply twice = apply once). It uses only CREATE OR REPLACE,
+-- DROP ... IF EXISTS, revoke/grant and DROP/CREATE POLICY, so it raises
+-- cleanly rather than silently skipping if a conflicting object shape exists.
 -- ============================================================================
 
 -- ---------------------------------------------------------------------------
--- 1. Tables
+-- 0. Drop the superseded SECURITY INVOKER RPC overloads.
+--    Their argument lists changed (a p_workspace_id was threaded through, plus
+--    save_draft's trace-pointer params), so CREATE OR REPLACE would leave the
+--    old insecure overloads callable. Dropping by exact signature removes them;
+--    IF EXISTS keeps this a no-op when the amended migration already ran.
 -- ---------------------------------------------------------------------------
-
--- 1.1 drafts ------------------------------------------------------------------
-create table if not exists public.drafts (
-  id uuid primary key default gen_random_uuid(),
-  workspace_id uuid not null references public.workspaces (id) on delete cascade,
-  subject text not null default ''
-    constraint drafts_subject_max_len check (char_length(subject) <= 500),
-  body_json jsonb not null
-    constraint drafts_body_json_is_doc check (
-      jsonb_typeof(body_json) = 'object'
-      and body_json ->> 'type' = 'doc'
-      and octet_length(body_json::text) <= 1048576
-    ),
-  status text not null default 'draft'
-    constraint drafts_status_allowed check (status in ('draft', 'archived')),
-  revision bigint not null default 1
-    constraint drafts_revision_positive check (revision > 0),
-  created_by uuid not null references public.users (id),
-  updated_by uuid not null references public.users (id),
-  last_autosaved_at timestamptz,
-  archived_at timestamptz,
-  last_template_version_id uuid,
-  last_signature_id uuid,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
-
-comment on table public.drafts is
-  'Phase 2: workspace-scoped email drafts with optimistic-concurrency revision counter.';
-comment on column public.drafts.body_json is
-  'Canonical TipTap-style document (root {"type":"doc",...}); max 1 MiB serialized.';
-comment on column public.drafts.revision is
-  'Optimistic concurrency token; save/restore RPCs raise SQLSTATE P0409 on mismatch.';
-comment on column public.drafts.last_template_version_id is
-  'Loose pointer to the template version last applied (no FK by design; informational).';
-comment on column public.drafts.last_signature_id is
-  'Loose pointer to the signature last applied (no FK by design; informational).';
-
-create index if not exists idx_drafts_workspace_id on public.drafts (workspace_id);
-create index if not exists idx_drafts_workspace_updated_at on public.drafts (workspace_id, updated_at desc);
-create index if not exists idx_drafts_workspace_status on public.drafts (workspace_id, status);
-create index if not exists idx_drafts_created_by on public.drafts (created_by);
-create index if not exists idx_drafts_updated_by on public.drafts (updated_by);
-
--- 1.2 draft_versions ----------------------------------------------------------
-create table if not exists public.draft_versions (
-  id uuid primary key default gen_random_uuid(),
-  workspace_id uuid not null references public.workspaces (id) on delete cascade,
-  draft_id uuid not null references public.drafts (id) on delete cascade,
-  version_no bigint not null
-    constraint draft_versions_version_no_positive check (version_no > 0),
-  source_revision bigint not null
-    constraint draft_versions_source_revision_positive check (source_revision > 0),
-  subject text not null
-    constraint draft_versions_subject_max_len check (char_length(subject) <= 500),
-  body_json jsonb not null
-    constraint draft_versions_body_json_is_doc check (
-      jsonb_typeof(body_json) = 'object'
-      and body_json ->> 'type' = 'doc'
-      and octet_length(body_json::text) <= 1048576
-    ),
-  reason text not null
-    constraint draft_versions_reason_allowed check (reason in (
-      'initial', 'autosave_checkpoint', 'manual_checkpoint',
-      'before_template', 'after_template',
-      'before_signature', 'after_signature', 'restore'
-    )),
-  created_by uuid not null references public.users (id),
-  created_at timestamptz not null default now(),
-  constraint draft_versions_draft_version_uq unique (draft_id, version_no)
-);
-
-comment on table public.draft_versions is
-  'Phase 2: immutable, append-only snapshots of draft content (version history).';
-comment on column public.draft_versions.source_revision is
-  'drafts.revision at (or right after) the moment the snapshot was taken.';
-
-create index if not exists idx_draft_versions_draft_version on public.draft_versions (draft_id, version_no desc);
-create index if not exists idx_draft_versions_workspace_id on public.draft_versions (workspace_id);
-
--- 1.3 draft_templates ---------------------------------------------------------
-create table if not exists public.draft_templates (
-  id uuid primary key default gen_random_uuid(),
-  workspace_id uuid not null references public.workspaces (id) on delete cascade,
-  name text not null
-    constraint draft_templates_name_max_len check (char_length(name) <= 200),
-  description text,
-  archived_at timestamptz,
-  created_by uuid not null references public.users (id),
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
-
-comment on table public.draft_templates is
-  'Phase 2: workspace-shared email templates (versioned via draft_template_versions).';
-
-create index if not exists idx_draft_templates_workspace_id on public.draft_templates (workspace_id);
-
--- 1.4 draft_template_versions -------------------------------------------------
-create table if not exists public.draft_template_versions (
-  id uuid primary key default gen_random_uuid(),
-  workspace_id uuid not null references public.workspaces (id) on delete cascade,
-  template_id uuid not null references public.draft_templates (id) on delete cascade,
-  version_no bigint not null
-    constraint draft_template_versions_version_no_positive check (version_no > 0),
-  subject_template text not null default ''
-    constraint draft_template_versions_subject_max_len check (char_length(subject_template) <= 500),
-  body_template_json jsonb not null
-    constraint draft_template_versions_body_is_doc check (
-      jsonb_typeof(body_template_json) = 'object'
-      and body_template_json ->> 'type' = 'doc'
-    ),
-  variable_schema jsonb not null default '[]'::jsonb
-    constraint draft_template_versions_variable_schema_is_array check (jsonb_typeof(variable_schema) = 'array'),
-  created_by uuid not null references public.users (id),
-  created_at timestamptz not null default now(),
-  constraint draft_template_versions_template_version_uq unique (template_id, version_no)
-);
-
-comment on table public.draft_template_versions is
-  'Phase 2: immutable, append-only template versions (content + variable schema).';
-
-create index if not exists idx_draft_template_versions_template_version
-  on public.draft_template_versions (template_id, version_no desc);
-create index if not exists idx_draft_template_versions_workspace_id
-  on public.draft_template_versions (workspace_id);
-
--- 1.5 signatures ---------------------------------------------------------------
-create table if not exists public.signatures (
-  id uuid primary key default gen_random_uuid(),
-  workspace_id uuid not null references public.workspaces (id) on delete cascade,
-  owner_user_id uuid not null references public.users (id) on delete cascade,
-  name text not null
-    constraint signatures_name_max_len check (char_length(name) <= 200),
-  body_json jsonb not null
-    constraint signatures_body_json_is_doc check (
-      jsonb_typeof(body_json) = 'object'
-      and body_json ->> 'type' = 'doc'
-      and octet_length(body_json::text) <= 1048576
-    ),
-  is_default boolean not null default false,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
-
-comment on table public.signatures is
-  'Phase 2: per-user email signatures. Private to their owner (RLS), one default per user+workspace.';
-
--- At most one default signature per (workspace, owner).
-create unique index if not exists uq_signatures_default_per_owner
-  on public.signatures (workspace_id, owner_user_id)
-  where is_default;
-comment on index public.uq_signatures_default_per_owner is
-  'Enforces a single default signature per user per workspace.';
-
-create index if not exists idx_signatures_workspace_id on public.signatures (workspace_id);
-create index if not exists idx_signatures_owner_user_id on public.signatures (owner_user_id);
-
--- 1.6 draft_attachments ---------------------------------------------------------
-create table if not exists public.draft_attachments (
-  id uuid primary key default gen_random_uuid(),
-  workspace_id uuid not null references public.workspaces (id) on delete cascade,
-  draft_id uuid not null references public.drafts (id) on delete cascade,
-  storage_bucket text not null default 'draft-attachments'
-    constraint draft_attachments_bucket_fixed check (storage_bucket = 'draft-attachments'),
-  storage_path text not null
-    constraint draft_attachments_storage_path_uq unique,
-  original_filename text not null
-    constraint draft_attachments_original_filename_max_len check (char_length(original_filename) <= 255),
-  safe_filename text not null
-    constraint draft_attachments_safe_filename_format check (safe_filename ~ '^[A-Za-z0-9._-]{1,200}$'),
-  mime_type text not null
-    constraint draft_attachments_mime_allowlist check (mime_type in (
-      'application/pdf', 'image/png', 'image/jpeg', 'text/plain'
-    )),
-  size_bytes bigint not null
-    constraint draft_attachments_size_range check (size_bytes > 0 and size_bytes <= 10485760),
-  sha256 text
-    constraint draft_attachments_sha256_format check (sha256 is null or sha256 ~ '^[a-f0-9]{64}$'),
-  status text not null default 'pending'
-    constraint draft_attachments_status_allowed check (status in ('pending', 'ready', 'failed', 'deleted')),
-  created_by uuid not null references public.users (id),
-  verified_at timestamptz,
-  deleted_at timestamptz,
-  created_at timestamptz not null default now(),
-  -- Deterministic object key: <workspace>/<draft>/<attachment>/<safe filename>.
-  -- Makes cross-workspace path forgery structurally impossible.
-  constraint draft_attachments_path_formula check (
-    storage_path = workspace_id::text || '/' || draft_id::text || '/' || id::text || '/' || safe_filename
-  )
-);
-
-comment on table public.draft_attachments is
-  'Phase 2: attachment metadata rows; binary lives in storage bucket draft-attachments under a constraint-enforced deterministic path.';
-comment on column public.draft_attachments.storage_path is
-  'Object key in the draft-attachments bucket; must equal workspace/draft/attachment/safe_filename (CHECK enforced).';
-comment on column public.draft_attachments.status is
-  'pending -> ready (finalize_attachment) | failed; deleted only after the storage object is gone.';
-
-create index if not exists idx_draft_attachments_draft_id on public.draft_attachments (draft_id);
-create index if not exists idx_draft_attachments_workspace_id on public.draft_attachments (workspace_id);
-create index if not exists idx_draft_attachments_draft_status on public.draft_attachments (draft_id, status);
+drop function if exists public.save_draft(uuid, bigint, text, jsonb, text);
+drop function if exists public.checkpoint_draft(uuid, bigint, text);
+drop function if exists public.restore_draft_version(uuid, uuid, bigint);
+drop function if exists public.create_template_version(uuid, text, jsonb, jsonb);
+drop function if exists public.create_attachment_intent(uuid, text, text, bigint);
+drop function if exists public.finalize_attachment(uuid, text);
+drop function if exists public.mark_attachment_deleted(uuid);
 
 -- ---------------------------------------------------------------------------
--- 2. Integrity trigger functions (SECURITY INVOKER, empty search_path)
--- ---------------------------------------------------------------------------
-
-create or replace function public.phase2_forbid_workspace_change()
-returns trigger
-language plpgsql
-security invoker
-set search_path = ''
-as $$
-begin
-  if new.workspace_id is distinct from old.workspace_id then
-    raise exception 'workspace_id is immutable on %', tg_table_name
-      using errcode = '23514';
-  end if;
-  return new;
-end;
-$$;
-comment on function public.phase2_forbid_workspace_change() is
-  'Phase 2 integrity: rows can never move between workspaces.';
-
-create or replace function public.phase2_forbid_created_by_change()
-returns trigger
-language plpgsql
-security invoker
-set search_path = ''
-as $$
-begin
-  if new.created_by is distinct from old.created_by then
-    raise exception 'created_by is immutable on %', tg_table_name
-      using errcode = '23514';
-  end if;
-  return new;
-end;
-$$;
-comment on function public.phase2_forbid_created_by_change() is
-  'Phase 2 integrity: authorship cannot be rewritten.';
-
-create or replace function public.phase2_forbid_owner_change()
-returns trigger
-language plpgsql
-security invoker
-set search_path = ''
-as $$
-begin
-  if new.owner_user_id is distinct from old.owner_user_id then
-    raise exception 'owner_user_id is immutable on %', tg_table_name
-      using errcode = '23514';
-  end if;
-  return new;
-end;
-$$;
-comment on function public.phase2_forbid_owner_change() is
-  'Phase 2 integrity: signature ownership cannot be transferred.';
-
-create or replace function public.phase2_version_rows_immutable()
-returns trigger
-language plpgsql
-security invoker
-set search_path = ''
-as $$
-begin
-  raise exception '% rows are immutable', tg_table_name
-    using errcode = '23514';
-end;
-$$;
-comment on function public.phase2_version_rows_immutable() is
-  'Phase 2 integrity: version history rows are append-only (UPDATE always raises). FK ON DELETE CASCADE still works because referential actions do not fire this UPDATE trigger.';
-
-create or replace function public.phase2_drafts_before_update()
-returns trigger
-language plpgsql
-security invoker
-set search_path = ''
-as $$
-begin
-  if new.revision < old.revision then
-    raise exception 'drafts.revision may never decrease (% -> %)', old.revision, new.revision
-      using errcode = '23514';
-  end if;
-  new.updated_at := now();
-  return new;
-end;
-$$;
-comment on function public.phase2_drafts_before_update() is
-  'Phase 2 integrity: keeps drafts.updated_at fresh and forbids revision rollback.';
-
-create or replace function public.phase2_draft_versions_check_parent()
-returns trigger
-language plpgsql
-security invoker
-set search_path = ''
-as $$
-declare
-  v_parent_workspace uuid;
-begin
-  select d.workspace_id into v_parent_workspace
-  from public.drafts d
-  where d.id = new.draft_id;
-
-  if v_parent_workspace is null or v_parent_workspace is distinct from new.workspace_id then
-    raise exception 'draft_versions.workspace_id must match the parent draft''s workspace'
-      using errcode = '23514';
-  end if;
-  return new;
-end;
-$$;
-comment on function public.phase2_draft_versions_check_parent() is
-  'Phase 2 integrity: a version snapshot must live in the same workspace as its draft. Runs as invoker; drafts RLS makes invisible parents look absent, which also raises.';
-
-create or replace function public.phase2_attachments_before_update()
-returns trigger
-language plpgsql
-security invoker
-set search_path = ''
-as $$
-begin
-  if new.status = 'ready' and old.status is distinct from 'ready' then
-    if new.verified_at is null then
-      raise exception 'attachment cannot become ready without verified_at'
-        using errcode = '23514';
-    end if;
-    -- Invoker-rights existence probe. The storage.objects SELECT policy lets
-    -- workspace members read their own workspace prefix, so a legitimate
-    -- finalize sees the object; anyone else (or a missing object) fails here.
-    if not exists (
-      select 1 from storage.objects o
-      where o.bucket_id = 'draft-attachments'
-        and o.name = new.storage_path
-    ) then
-      raise exception 'attachment cannot become ready: storage object % not found', new.storage_path
-        using errcode = '23514';
-    end if;
-  end if;
-  return new;
-end;
-$$;
-comment on function public.phase2_attachments_before_update() is
-  'Phase 2 integrity: status=ready requires verified_at and a real storage object at storage_path.';
-
--- Trigger functions are internal machinery: nobody calls them directly.
-revoke execute on function
-  public.phase2_forbid_workspace_change(),
-  public.phase2_forbid_created_by_change(),
-  public.phase2_forbid_owner_change(),
-  public.phase2_version_rows_immutable(),
-  public.phase2_drafts_before_update(),
-  public.phase2_draft_versions_check_parent(),
-  public.phase2_attachments_before_update()
-from public, anon, authenticated;
-
--- ---------------------------------------------------------------------------
--- 3. Triggers
--- ---------------------------------------------------------------------------
-
-create or replace trigger trg_drafts_forbid_workspace_change
-  before update on public.drafts
-  for each row execute function public.phase2_forbid_workspace_change();
-comment on trigger trg_drafts_forbid_workspace_change on public.drafts is
-  'Phase 2: workspace_id immutable.';
-
-create or replace trigger trg_drafts_forbid_created_by_change
-  before update on public.drafts
-  for each row execute function public.phase2_forbid_created_by_change();
-comment on trigger trg_drafts_forbid_created_by_change on public.drafts is
-  'Phase 2: created_by immutable.';
-
-create or replace trigger trg_drafts_touch
-  before update on public.drafts
-  for each row execute function public.phase2_drafts_before_update();
-comment on trigger trg_drafts_touch on public.drafts is
-  'Phase 2: refresh updated_at, forbid revision decrease.';
-
-create or replace trigger trg_draft_versions_immutable
-  before update on public.draft_versions
-  for each row execute function public.phase2_version_rows_immutable();
-comment on trigger trg_draft_versions_immutable on public.draft_versions is
-  'Phase 2: version snapshots are append-only.';
-
-create or replace trigger trg_draft_versions_check_parent
-  before insert on public.draft_versions
-  for each row execute function public.phase2_draft_versions_check_parent();
-comment on trigger trg_draft_versions_check_parent on public.draft_versions is
-  'Phase 2: workspace_id must match the parent draft.';
-
-create or replace trigger trg_draft_templates_forbid_workspace_change
-  before update on public.draft_templates
-  for each row execute function public.phase2_forbid_workspace_change();
-comment on trigger trg_draft_templates_forbid_workspace_change on public.draft_templates is
-  'Phase 2: workspace_id immutable.';
-
-create or replace trigger trg_draft_templates_forbid_created_by_change
-  before update on public.draft_templates
-  for each row execute function public.phase2_forbid_created_by_change();
-comment on trigger trg_draft_templates_forbid_created_by_change on public.draft_templates is
-  'Phase 2: created_by immutable.';
-
-create or replace trigger trg_draft_template_versions_immutable
-  before update on public.draft_template_versions
-  for each row execute function public.phase2_version_rows_immutable();
-comment on trigger trg_draft_template_versions_immutable on public.draft_template_versions is
-  'Phase 2: template versions are append-only.';
-
-create or replace trigger trg_signatures_forbid_workspace_change
-  before update on public.signatures
-  for each row execute function public.phase2_forbid_workspace_change();
-comment on trigger trg_signatures_forbid_workspace_change on public.signatures is
-  'Phase 2: workspace_id immutable.';
-
-create or replace trigger trg_signatures_forbid_owner_change
-  before update on public.signatures
-  for each row execute function public.phase2_forbid_owner_change();
-comment on trigger trg_signatures_forbid_owner_change on public.signatures is
-  'Phase 2: owner_user_id immutable.';
-
-create or replace trigger trg_draft_attachments_forbid_workspace_change
-  before update on public.draft_attachments
-  for each row execute function public.phase2_forbid_workspace_change();
-comment on trigger trg_draft_attachments_forbid_workspace_change on public.draft_attachments is
-  'Phase 2: workspace_id immutable.';
-
-create or replace trigger trg_draft_attachments_forbid_created_by_change
-  before update on public.draft_attachments
-  for each row execute function public.phase2_forbid_created_by_change();
-comment on trigger trg_draft_attachments_forbid_created_by_change on public.draft_attachments is
-  'Phase 2: created_by immutable.';
-
-create or replace trigger trg_draft_attachments_guard_ready
-  before update on public.draft_attachments
-  for each row execute function public.phase2_attachments_before_update();
-comment on trigger trg_draft_attachments_guard_ready on public.draft_attachments is
-  'Phase 2: status=ready requires verification + existing storage object.';
-
--- ---------------------------------------------------------------------------
--- 4. RPCs and helpers (mutation RPCs are SECURITY DEFINER; empty search_path)
---
--- All mutation RPCs run SECURITY DEFINER so they remain the ONLY write path
--- for the SELECT-only Phase 2 tables (drafts, draft_versions,
--- draft_template_versions, draft_attachments). Each rejects a null auth.uid()
--- (42501), performs an explicit is_workspace_member()/ownership check (never
--- relying on the DEFINER RLS bypass), rejects a client workspace_id mismatch,
--- locks the target row FOR UPDATE before invariant checks, and derives
--- created_by/version_no/source_revision server-side. save_draft raises P0409
--- with hint 'current_revision=N' on a stale revision. set_default_signature
--- stays SECURITY INVOKER because signatures remain owner-writable by design.
+-- 1. (Re)create helpers + SECURITY DEFINER RPCs and their EXECUTE grants.
+--    create_draft and set_default_signature keep their original signatures;
+--    CREATE OR REPLACE flips create_draft INVOKER -> DEFINER in place.
+--    This block is byte-for-byte identical to section 4 of the amended
+--    20260711130000, which is what makes the two deploy paths converge.
 -- ---------------------------------------------------------------------------
 
 -- 4.0 Shared helper functions ------------------------------------------------
@@ -1306,15 +881,10 @@ grant execute on function public.phase2_safe_filename(text) to service_role;
 grant execute on function public.phase2_validate_variable_schema(jsonb) to service_role;
 
 -- ---------------------------------------------------------------------------
--- 5. Table grants (defence in depth: the RPCs above are the only write path)
+-- 2. Collapse direct table privileges to the secure model.
+--    revoke-from-authenticated (not just anon/public) defeats the original
+--    insecure grants and any inherited/default-ACL privilege.
 -- ---------------------------------------------------------------------------
--- authenticated may only READ the four RPC-governed tables; draft_templates
--- additionally allows INSERT/UPDATE (parent metadata, no bypassable invariant,
--- RLS pins created_by + membership) and signatures allows full owner DML
--- (owner-private RLS + single-default partial unique index + frozen
--- owner/workspace triggers). anon gets nothing. Revoking from authenticated as
--- well defeats any inherited / default-ACL privilege.
-
 revoke all on table
   public.drafts, public.draft_versions,
   public.draft_templates, public.draft_template_versions,
@@ -1327,11 +897,7 @@ grant select on table
   public.signatures, public.draft_attachments
 to authenticated;
 
--- draft_templates: parent metadata is member-writable (no version invariant here).
 grant insert, update on table public.draft_templates to authenticated;
-
--- signatures: owner-private, guarded by the single-default unique index and the
--- owner/workspace immutability triggers, so owner-scoped direct DML is safe.
 grant insert, update, delete on table public.signatures to authenticated;
 
 grant all on table
@@ -1341,175 +907,9 @@ grant all on table
 to service_role;
 
 -- ---------------------------------------------------------------------------
--- 6. Row Level Security
+-- 3. Storage: ensure the private bucket exists and rebuild the object policies
+--    in their hardened form (idempotent drop/create; no UPDATE policy).
 -- ---------------------------------------------------------------------------
-
-alter table public.drafts enable row level security;
-alter table public.draft_versions enable row level security;
-alter table public.draft_templates enable row level security;
-alter table public.draft_template_versions enable row level security;
-alter table public.signatures enable row level security;
-alter table public.draft_attachments enable row level security;
-
--- 6.1 drafts: shared inside the workspace.
-drop policy if exists drafts_select_members on public.drafts;
-create policy drafts_select_members on public.drafts
-  for select to authenticated
-  using (public.is_workspace_member(workspace_id));
-comment on policy drafts_select_members on public.drafts is
-  'Phase 2: workspace members read all drafts of their workspaces.';
-
-drop policy if exists drafts_insert_members on public.drafts;
-create policy drafts_insert_members on public.drafts
-  for insert to authenticated
-  with check (
-    public.is_workspace_member(workspace_id)
-    and created_by = auth.uid()
-    and updated_by = auth.uid()
-  );
-comment on policy drafts_insert_members on public.drafts is
-  'Phase 2: members create drafts in their own name only.';
-
-drop policy if exists drafts_update_members on public.drafts;
-create policy drafts_update_members on public.drafts
-  for update to authenticated
-  using (public.is_workspace_member(workspace_id))
-  with check (
-    public.is_workspace_member(workspace_id)
-    and updated_by = auth.uid()
-  );
-comment on policy drafts_update_members on public.drafts is
-  'Phase 2: members update workspace drafts; updated_by must be the caller.';
-
-drop policy if exists drafts_delete_members on public.drafts;
-create policy drafts_delete_members on public.drafts
-  for delete to authenticated
-  using (public.is_workspace_member(workspace_id));
-comment on policy drafts_delete_members on public.drafts is
-  'Phase 2: members delete workspace drafts.';
-
--- 6.2 draft_versions: append-only history (no UPDATE/DELETE policies at all).
-drop policy if exists draft_versions_select_members on public.draft_versions;
-create policy draft_versions_select_members on public.draft_versions
-  for select to authenticated
-  using (public.is_workspace_member(workspace_id));
-comment on policy draft_versions_select_members on public.draft_versions is
-  'Phase 2: workspace members read version history.';
-
-drop policy if exists draft_versions_insert_members on public.draft_versions;
-create policy draft_versions_insert_members on public.draft_versions
-  for insert to authenticated
-  with check (
-    public.is_workspace_member(workspace_id)
-    and created_by = auth.uid()
-  );
-comment on policy draft_versions_insert_members on public.draft_versions is
-  'Phase 2: members append snapshots in their own name only.';
-
--- 6.3 draft_templates: workspace-shared.
-drop policy if exists draft_templates_select_members on public.draft_templates;
-create policy draft_templates_select_members on public.draft_templates
-  for select to authenticated
-  using (public.is_workspace_member(workspace_id));
-comment on policy draft_templates_select_members on public.draft_templates is
-  'Phase 2: workspace members read templates.';
-
-drop policy if exists draft_templates_insert_members on public.draft_templates;
-create policy draft_templates_insert_members on public.draft_templates
-  for insert to authenticated
-  with check (
-    public.is_workspace_member(workspace_id)
-    and created_by = auth.uid()
-  );
-comment on policy draft_templates_insert_members on public.draft_templates is
-  'Phase 2: members create templates in their own name only.';
-
-drop policy if exists draft_templates_update_members on public.draft_templates;
-create policy draft_templates_update_members on public.draft_templates
-  for update to authenticated
-  using (public.is_workspace_member(workspace_id))
-  with check (public.is_workspace_member(workspace_id));
-comment on policy draft_templates_update_members on public.draft_templates is
-  'Phase 2: members update workspace templates.';
-
-drop policy if exists draft_templates_delete_members on public.draft_templates;
-create policy draft_templates_delete_members on public.draft_templates
-  for delete to authenticated
-  using (public.is_workspace_member(workspace_id));
-comment on policy draft_templates_delete_members on public.draft_templates is
-  'Phase 2: members delete workspace templates.';
-
--- 6.4 draft_template_versions: append-only (no UPDATE/DELETE policies).
-drop policy if exists draft_template_versions_select_members on public.draft_template_versions;
-create policy draft_template_versions_select_members on public.draft_template_versions
-  for select to authenticated
-  using (public.is_workspace_member(workspace_id));
-comment on policy draft_template_versions_select_members on public.draft_template_versions is
-  'Phase 2: workspace members read template versions.';
-
-drop policy if exists draft_template_versions_insert_members on public.draft_template_versions;
-create policy draft_template_versions_insert_members on public.draft_template_versions
-  for insert to authenticated
-  with check (
-    public.is_workspace_member(workspace_id)
-    and created_by = auth.uid()
-  );
-comment on policy draft_template_versions_insert_members on public.draft_template_versions is
-  'Phase 2: members append template versions in their own name only.';
-
--- 6.5 signatures: strictly private to their owner, even for SELECT.
-drop policy if exists signatures_owner_all on public.signatures;
-create policy signatures_owner_all on public.signatures
-  for all to authenticated
-  using (
-    owner_user_id = auth.uid()
-    and public.is_workspace_member(workspace_id)
-  )
-  with check (
-    owner_user_id = auth.uid()
-    and public.is_workspace_member(workspace_id)
-  );
-comment on policy signatures_owner_all on public.signatures is
-  'Phase 2: signatures are visible and writable only by their owning workspace member.';
-
--- 6.6 draft_attachments: workspace-shared metadata.
-drop policy if exists draft_attachments_select_members on public.draft_attachments;
-create policy draft_attachments_select_members on public.draft_attachments
-  for select to authenticated
-  using (public.is_workspace_member(workspace_id));
-comment on policy draft_attachments_select_members on public.draft_attachments is
-  'Phase 2: workspace members read attachment metadata.';
-
-drop policy if exists draft_attachments_insert_members on public.draft_attachments;
-create policy draft_attachments_insert_members on public.draft_attachments
-  for insert to authenticated
-  with check (
-    public.is_workspace_member(workspace_id)
-    and created_by = auth.uid()
-  );
-comment on policy draft_attachments_insert_members on public.draft_attachments is
-  'Phase 2: members create attachment rows in their own name only.';
-
-drop policy if exists draft_attachments_update_members on public.draft_attachments;
-create policy draft_attachments_update_members on public.draft_attachments
-  for update to authenticated
-  using (public.is_workspace_member(workspace_id))
-  with check (public.is_workspace_member(workspace_id));
-comment on policy draft_attachments_update_members on public.draft_attachments is
-  'Phase 2: members update attachment metadata (integrity triggers gate ready).';
-
-drop policy if exists draft_attachments_delete_members on public.draft_attachments;
-create policy draft_attachments_delete_members on public.draft_attachments
-  for delete to authenticated
-  using (public.is_workspace_member(workspace_id));
-comment on policy draft_attachments_delete_members on public.draft_attachments is
-  'Phase 2: members delete attachment metadata rows.';
-
--- ---------------------------------------------------------------------------
--- 7. Storage: bucket + object policies
--- ---------------------------------------------------------------------------
-
--- Private bucket for draft attachments (idempotent).
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values (
   'draft-attachments',
@@ -1520,64 +920,42 @@ values (
 )
 on conflict (id) do nothing;
 
--- Object access is keyed off the first path segment (the workspace uuid):
--- SELECT / INSERT / DELETE for workspace members, and deliberately NO UPDATE
--- policy (objects are immutable; replace = delete + re-upload + re-finalize).
-do $$
-begin
-  if not exists (
-    select 1 from pg_policies
-    where schemaname = 'storage' and tablename = 'objects'
-      and policyname = 'draft_attachments_objects_select_members'
-  ) then
-    create policy draft_attachments_objects_select_members on storage.objects
-      for select to authenticated
-      using (
-        bucket_id = 'draft-attachments'
-        and public.is_workspace_member(((storage.foldername(name))[1])::uuid)
-      );
-    comment on policy draft_attachments_objects_select_members on storage.objects is
-      'Phase 2: members read draft-attachment objects under their workspace prefix.';
-  end if;
+drop policy if exists draft_attachments_objects_select_members on storage.objects;
+create policy draft_attachments_objects_select_members on storage.objects
+  for select to authenticated
+  using (
+    bucket_id = 'draft-attachments'
+    and public.is_workspace_member(((storage.foldername(name))[1])::uuid)
+  );
+comment on policy draft_attachments_objects_select_members on storage.objects is
+  'Phase 2: members read draft-attachment objects under their workspace prefix.';
 
-  if not exists (
-    select 1 from pg_policies
-    where schemaname = 'storage' and tablename = 'objects'
-      and policyname = 'draft_attachments_objects_insert_members'
-  ) then
-    create policy draft_attachments_objects_insert_members on storage.objects
-      for insert to authenticated
-      with check (
-        bucket_id = 'draft-attachments'
-        and exists (
-          select 1 from public.draft_attachments a
-          where a.storage_path = name
-            and a.status = 'pending'
-            and a.created_by = auth.uid()
-            and public.is_workspace_member(a.workspace_id)
-        )
-      );
-    comment on policy draft_attachments_objects_insert_members on storage.objects is
-      'Phase 2 (hardened): an object may be uploaded only while a matching pending draft_attachments intent row exists (same storage_path, created by the caller, in a workspace the caller belongs to). Blocks arbitrary-path, wrong-workspace, wrong-draft and post-ready re-uploads.';
-  end if;
+drop policy if exists draft_attachments_objects_insert_members on storage.objects;
+create policy draft_attachments_objects_insert_members on storage.objects
+  for insert to authenticated
+  with check (
+    bucket_id = 'draft-attachments'
+    and exists (
+      select 1 from public.draft_attachments a
+      where a.storage_path = name
+        and a.status = 'pending'
+        and a.created_by = auth.uid()
+        and public.is_workspace_member(a.workspace_id)
+    )
+  );
+comment on policy draft_attachments_objects_insert_members on storage.objects is
+  'Phase 2 (hardened): an object may be uploaded only while a matching pending draft_attachments intent row exists (same storage_path, created by the caller, in a workspace the caller belongs to). Blocks arbitrary-path, wrong-workspace, wrong-draft and post-ready re-uploads.';
 
-  if not exists (
-    select 1 from pg_policies
-    where schemaname = 'storage' and tablename = 'objects'
-      and policyname = 'draft_attachments_objects_delete_members'
-  ) then
-    create policy draft_attachments_objects_delete_members on storage.objects
-      for delete to authenticated
-      using (
-        bucket_id = 'draft-attachments'
-        and public.is_workspace_member(((storage.foldername(name))[1])::uuid)
-      );
-    comment on policy draft_attachments_objects_delete_members on storage.objects is
-      'Phase 2: members remove draft-attachment objects under their workspace prefix.';
-  end if;
-end
-$$;
+drop policy if exists draft_attachments_objects_delete_members on storage.objects;
+create policy draft_attachments_objects_delete_members on storage.objects
+  for delete to authenticated
+  using (
+    bucket_id = 'draft-attachments'
+    and public.is_workspace_member(((storage.foldername(name))[1])::uuid)
+  );
+comment on policy draft_attachments_objects_delete_members on storage.objects is
+  'Phase 2: members remove draft-attachment objects under their workspace prefix.';
 
 -- ============================================================================
--- End of migration 20260711130000_draft_lifecycle.sql
+-- End of migration 20260712100000_enforce_phase2_rpc_invariants.sql
 -- ============================================================================

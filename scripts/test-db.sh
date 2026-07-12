@@ -158,6 +158,62 @@ if [[ $test_count -eq 0 ]]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Migration equivalence + idempotency.
+#
+# Three deploy paths must converge to an identical security-relevant schema:
+#   A)  baseline -> amended 20260711130000                 (born secure)
+#   B)  baseline -> ORIGINAL (insecure) 20260711130000 -> hardening migration
+#   AB) baseline -> amended 20260711130000 -> hardening x2  (re-runnable, no-op)
+# We build each in a throwaway database, dump a normalized security snapshot,
+# and diff. Any difference fails the run.
+# ---------------------------------------------------------------------------
+BASELINE=supabase/baseline/production_schema_2026_07_11.sql
+MIG_A=supabase/migrations/20260711130000_draft_lifecycle.sql
+FIXTURE=supabase/tests/fixtures/prior_insecure_20260711130000.sql
+MIG_B=supabase/migrations/20260712100000_enforce_phase2_rpc_invariants.sql
+SNAPSHOT=supabase/tests/security_snapshot.sql
+
+build_path() {
+  local db="$1"; shift
+  local f out
+  psql "${PSQL_ARGS[@]}" -d postgres -q \
+    -c "DROP DATABASE IF EXISTS $db;" -c "CREATE DATABASE $db;" >/dev/null
+  for f in "$@"; do
+    if ! out="$(psql "${PSQL_ARGS[@]}" -d "$db" -v ON_ERROR_STOP=1 -q -f "$f" 2>&1)"; then
+      echo "ERROR: applying $f to $db failed:" >&2
+      printf '%s\n' "$out" | tail -30 >&2
+      exit 1
+    fi
+  done
+}
+
+echo ""
+echo "Migration equivalence check..."
+build_path phase2_path_a  "$BASELINE" "$MIG_A"
+build_path phase2_path_b  "$BASELINE" "$FIXTURE" "$MIG_B"
+build_path phase2_path_ab "$BASELINE" "$MIG_A" "$MIG_B" "$MIG_B"
+for p in a b ab; do
+  psql "${PSQL_ARGS[@]}" -d "phase2_path_$p" -X -A -t -f "$SNAPSHOT" > "$DATA_DIR.snap_$p.txt" 2>&1
+done
+equiv_fail=0
+if ! diff -u "$DATA_DIR.snap_a.txt" "$DATA_DIR.snap_b.txt"; then
+  echo "FAIL: baseline->A differs from baseline->fixture->B" >&2; equiv_fail=1
+fi
+if ! diff -u "$DATA_DIR.snap_a.txt" "$DATA_DIR.snap_ab.txt"; then
+  echo "FAIL: baseline->A differs from baseline->A->B->B" >&2; equiv_fail=1
+fi
+psql "${PSQL_ARGS[@]}" -d postgres -q \
+  -c "DROP DATABASE IF EXISTS phase2_path_a;" \
+  -c "DROP DATABASE IF EXISTS phase2_path_b;" \
+  -c "DROP DATABASE IF EXISTS phase2_path_ab;" >/dev/null 2>&1 || true
+rm -f "$DATA_DIR.snap_a.txt" "$DATA_DIR.snap_b.txt" "$DATA_DIR.snap_ab.txt"
+if [[ "$equiv_fail" == "1" ]]; then
+  echo "Migration equivalence FAILED." >&2
+  exit 1
+fi
+echo "  equivalence OK: baseline->A == baseline->fixture->B == baseline->A->B->B (B idempotent)"
+
 echo ""
 echo "Database tests completed successfully ($test_count suite(s))."
 

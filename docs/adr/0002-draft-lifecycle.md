@@ -113,15 +113,46 @@ Phase 3 transport worker.
 
 Every new table has RLS enabled and uses the existing membership model
 (`public.is_workspace_member(workspace_id)`), mirroring the production core
-schema. INSERT policies verify both membership and `created_by =
-auth.uid()` (or `owner_user_id = auth.uid()`); UPDATE policies define both
-USING and WITH CHECK; `workspace_id`, `created_by`, and `owner_user_id` are
-frozen by triggers so records cannot be moved across workspaces or
-attributed to someone else. Grants are managed separately from RLS: version
-tables get no UPDATE/DELETE grants for `authenticated`, `anon` has no grants
-on any Phase 2 table, and all RPCs revoke EXECUTE from PUBLIC/anon. The RPCs
-are SECURITY INVOKER with a fixed `search_path` — RLS applies inside them;
-no SECURITY DEFINER was needed for Phase 2.
+schema. INSERT/UPDATE policies verify both membership and `created_by =
+auth.uid()` (or `owner_user_id = auth.uid()`), define both USING and WITH
+CHECK, and freeze `workspace_id`, `created_by`, and `owner_user_id` via
+triggers so records cannot be moved across workspaces or attributed to someone
+else. `anon` has no grants on any Phase 2 table, and all RPCs revoke EXECUTE
+from PUBLIC/anon.
+
+**Corrective hardening (2026-07-12):** RLS alone did not enforce the lifecycle
+invariants — a member could call PostgREST directly and bypass the RPCs
+(rewrite `revision`, forge a version, flip an attachment to `ready`). The
+mutation RPCs are therefore **SECURITY DEFINER** with a fixed `search_path`
+and in-body authorization (assert `auth.uid()`, then re-check
+`is_workspace_member`, raising `P0002` otherwise), and direct
+`INSERT/UPDATE/DELETE` on the invariant-bearing tables (`drafts`,
+`draft_versions`, `draft_template_versions`, `draft_attachments`) is revoked
+from `authenticated` — they are **SELECT-only**, making the RPCs the sole write
+path. `draft_templates` (INSERT/UPDATE) and `signatures` (INSERT/UPDATE/DELETE)
+keep direct DML as deliberate exceptions with no cross-row invariant. The
+policies above remain as defense in depth. See
+`docs/security/phase-2-review.md` for the full rationale.
+
+### Corrective hardening: two-migration strategy
+
+The invariants above must hold even for an environment that already applied the
+first Phase 2 migration before it was hardened. Rather than drop and recreate,
+the fix ships as two migrations that converge on identical security-relevant
+schema:
+
+- `20260711130000_draft_lifecycle.sql` was **amended in place** so a fresh
+  deploy is born secure (SECURITY DEFINER RPCs, SELECT-only grants);
+- `20260712100000_enforce_phase2_rpc_invariants.sql` is an additive,
+  idempotent migration that converges an environment which ran the _original_
+  insecure version into the same state (drops the old INVOKER overloads,
+  recreates the DEFINER RPCs, collapses grants, re-scopes the Storage INSERT
+  policy to a matching pending intent).
+
+`pnpm test:db` includes a migration-equivalence check proving
+`baseline → amended` == `baseline → original → hardening` ==
+`baseline → amended → hardening ×2` (the hardening migration is a re-runnable
+no-op), so both deploy paths are provably equivalent and safe to re-run.
 
 ### Why the service role is prohibited in the UI
 
@@ -134,21 +165,22 @@ run by CI) guards against reintroduction.
 
 ### Why the production migration is not automatic
 
-The Phase 2 migration is deployable but NOT applied by this repository, its
-CI, or this PR. Applying schema + RLS changes to production is a separate,
-explicitly approved operational step (see the production deployment package
-in docs/security/phase-2-review.md): it changes authorization surfaces and
-creates a Storage bucket, and must be verified with the documented
-pre-/post-deployment queries by a human. CI runs against an isolated local
-database initialized from a non-deployable baseline snapshot of the current
-production schema.
+The two Phase 2 migrations are deployable but NOT applied by this repository,
+its CI, or this PR. Applying schema + RLS + grant changes to production is a
+separate, explicitly approved operational step (see the production deployment
+package in docs/security/phase-2-review.md): it changes authorization surfaces
+(revokes direct DML, converts RPCs to SECURITY DEFINER) and creates a Storage
+bucket, and must be verified with the documented pre-/post-deployment queries
+by a human — including a fresh GO/NO-GO and dashboard confirmation of
+backup/PITR posture. CI runs against an isolated local database initialized
+from a non-deployable baseline snapshot of the current production schema.
 
 ### Rollback and disable strategy
 
 `NEXT_PUBLIC_DRAFT_LIFECYCLE_V1_ENABLED` gates every Phase 2 page and API
 route and defaults to disabled (fail closed). Setting it to anything but
-"true" fully disables the surface without a code revert. The database
-migration is additive-only; if the feature is rolled back at the application
+"true" fully disables the surface without a code revert. Both database
+migrations are additive-only; if the feature is rolled back at the application
 layer the new tables simply sit unused. Destructive rollback of the schema
 (dropping tables) is documented as a manual, data-loss operation that is not
 part of the standard rollback path.

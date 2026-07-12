@@ -117,6 +117,7 @@ describe("DraftList", () => {
 
   it("archives a draft and refreshes the list", async () => {
     let archived = false;
+    let archiveBody: unknown;
     stubFetch([
       on("GET", "/api/workspaces/ws-1/drafts", () =>
         jsonResponse(200, {
@@ -124,6 +125,7 @@ describe("DraftList", () => {
             makeDraft({
               id: "d1",
               subject: "To archive",
+              revision: 4,
               ...(archived
                 ? {
                     status: "archived" as const,
@@ -134,8 +136,9 @@ describe("DraftList", () => {
           ],
         }),
       ),
-      on("DELETE", "/api/workspaces/ws-1/drafts/d1", () => {
+      on("DELETE", "/api/workspaces/ws-1/drafts/d1", (call) => {
         archived = true;
+        archiveBody = call.body;
         return jsonResponse(200, { archived: true });
       }),
     ]);
@@ -149,6 +152,9 @@ describe("DraftList", () => {
     await waitFor(() => {
       expect(screen.getByText("Archived")).toBeDefined();
     });
+    // Archive now goes through the archive_draft RPC and carries the draft's
+    // current revision for optimistic-concurrency checking.
+    expect(archiveBody).toEqual({ expectedRevision: 4 });
   });
 
   it("shows a sign-in-required state on 401 without crashing", async () => {

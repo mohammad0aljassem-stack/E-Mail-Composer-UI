@@ -173,6 +173,7 @@ export const RPC = {
   saveDraft: "save_draft",
   checkpointDraft: "checkpoint_draft",
   restoreDraftVersion: "restore_draft_version",
+  archiveDraft: "archive_draft",
   createTemplateVersion: "create_template_version",
   setDefaultSignature: "set_default_signature",
   createAttachmentIntent: "create_attachment_intent",

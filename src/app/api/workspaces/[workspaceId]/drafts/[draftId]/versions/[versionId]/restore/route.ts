@@ -50,6 +50,7 @@ export async function POST(
     RPC.restoreDraftVersion,
     {
       p_draft_id: draftId,
+      p_workspace_id: workspaceId,
       p_version_id: versionId,
       p_expected_revision: payload.expectedRevision,
     },

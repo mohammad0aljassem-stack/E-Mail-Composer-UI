@@ -54,7 +54,11 @@ export async function POST(
 
   const { data, error } = await guard.context.supabase.rpc(
     RPC.finalizeAttachment,
-    { p_attachment_id: attachmentId, p_sha256: sha256 ?? undefined },
+    {
+      p_attachment_id: attachmentId,
+      p_workspace_id: workspaceId,
+      p_sha256: sha256 ?? undefined,
+    },
   );
   if (error) {
     if (error.code?.startsWith("P0")) {

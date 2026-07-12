@@ -109,6 +109,7 @@ export async function POST(
   const { data: version, error: versionError } =
     await guard.context.supabase.rpc(RPC.createTemplateVersion, {
       p_template_id: (template as { id: string }).id,
+      p_workspace_id: workspaceId,
       p_subject_template: subjectTemplate,
       p_body_template_json: toDbJson(templateValidation.document),
       p_variable_schema: toDbJson(schemaValidation.variables),

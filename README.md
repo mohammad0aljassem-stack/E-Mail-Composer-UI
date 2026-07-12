@@ -96,7 +96,7 @@ and `/api/workspaces/**` routes require a valid Supabase Auth session
 (unauthenticated calls get `401`); configuring an auth provider and sign-in
 UX is outside this repository's scope.
 
-### Local database, baseline, and the Phase 2 migration
+### Local database, baseline, and the Phase 2 migrations
 
 The repo does not contain the historical migrations that created the
 production core schema. Instead:
@@ -104,15 +104,33 @@ production core schema. Instead:
 - `supabase/baseline/production_schema_2026_07_11.sql` — a **non-deployable**
   snapshot of the current production schema (test scaffolding only; see
   `supabase/baseline/README.md` for its checksum and provenance);
-- `supabase/migrations/20260711130000_draft_lifecycle.sql` — the **only
-  deployable** artifact of Phase 2 (additive).
+- `supabase/migrations/20260711130000_draft_lifecycle.sql` — the Phase 2
+  draft-lifecycle schema (additive; amended so it is **born secure**:
+  SECURITY DEFINER mutation RPCs, SELECT-only direct grants);
+- `supabase/migrations/20260712100000_enforce_phase2_rpc_invariants.sql` —
+  a corrective **hardening** migration that converts an environment which
+  already ran the _original_ (insecure) draft-lifecycle migration into the
+  same secure state. It is idempotent and additive.
 
-Run the database + RLS test suite against an isolated local PostgreSQL
+Two-migration strategy: any environment that applied the first migration
+before it was amended must not be dropped and re-created, so the hardening
+migration exists to converge it. A brand-new environment reaches the identical
+end state from the amended first migration alone. `pnpm test:db` proves this
+with a **migration-equivalence** check that compares three convergent paths
+via `supabase/tests/security_snapshot.sql`:
+
+- **A** baseline → amended `20260711130000` (born secure);
+- **B** baseline → _original_ `20260711130000` → hardening migration;
+- **AB** baseline → amended `20260711130000` → hardening ×2 (re-runnable no-op).
+
+Run the database + RLS test suites against an isolated local PostgreSQL
 (no Docker required for the tests; PostgreSQL 16 binaries needed):
 
 ```bash
-pnpm test:db          # throwaway cluster: baseline -> migration (applied
-                      # twice, idempotency check) -> SQL test suites
+pnpm test:db          # throwaway cluster: baseline -> amended migration
+                      # (applied twice, idempotency) -> the three SQL suites
+                      # (draft_lifecycle, grant_matrix, direct_write_regression)
+                      # -> migration-equivalence check (paths A == B == AB)
 pnpm gen:types        # regenerate src/lib/supabase/database.types.ts
                       # (needs DB_URL and Docker; see scripts/gen-types.sh)
 ```
@@ -124,13 +142,13 @@ production. Generation needs a Docker daemon because the CLI runs
 postgres-meta in a container.
 
 CI's database job replays the same pipeline and enforces both gates:
-it loads the baseline, applies the Phase 2 migration twice (idempotency),
-runs the SQL/RLS suites, then regenerates the types from that exact
-schema and **fails on any byte-level drift** from the committed file
-("Verify generated database types are current"). **The production
-migration is never applied automatically** — production deployment is a
-separate, explicitly approved operational step (see
-`docs/security/phase-2-review.md`).
+it loads the baseline, applies the amended Phase 2 migration twice
+(idempotency), runs the three SQL/RLS suites and the equivalence check,
+then regenerates the types from that exact schema and **fails on any
+byte-level drift** from the committed file ("Verify generated database
+types are current"). **The production migrations are never applied
+automatically** — production deployment is a separate, explicitly approved
+operational step (see `docs/security/phase-2-review.md`).
 
 ## Draft lifecycle (Phase 2)
 
@@ -190,7 +208,11 @@ src/
   app/
     page.tsx                     # landing page
     composer-lab/page.tsx        # isolated development laboratory
+    w/[workspaceId]/drafts/      # Phase 2 draft list + editor pages
     api/composer/render/route.ts # dev-only preview endpoint (JSON in, {html,text} out)
+    api/workspaces/[workspaceId]/…  # Phase 2 workspace-scoped API routes
+                                 #   drafts, versions/restore, templates,
+                                 #   signatures, attachments (RPC-backed)
   components/composer/
     ComposerEditor.tsx           # Tiptap editor (client)
     ComposerToolbar.tsx          # accessible formatting toolbar
@@ -198,17 +220,30 @@ src/
     ComposerJsonPanel.tsx        # live canonical JSON
     ComposerLab.tsx              # lab page composition + localStorage demo
     editorExtensions.ts          # Tiptap schema (safe node/mark subset)
+  components/drafts/             # Phase 2 draft editor, list, version history
+  components/templates/          # Phase 2 template picker, signature manager
+  components/attachments/        # Phase 2 attachment panel + manifest preview
   lib/composer/
     canonical.ts                 # canonical model, validation, normalization
     links.ts                     # centralized URL policy
     plain-text.ts                # deterministic plain-text rendering
     samples.ts                   # Arabic + German sample document
+  lib/api/route-helpers.ts       # Phase 2 guard, error mapping, uniform 404s
+  lib/phase2/contracts.ts        # shared DTO/RPC/error contracts
+  lib/supabase/                  # SSR/browser clients, auth, generated types
   server/render/
     DraftEmail.tsx               # React Email template
     renderDraft.ts               # server-only render entrypoint
     sanitize.ts                  # output-side HTML firewall (defense in depth)
   tests/                         # Vitest suites
+supabase/
+  baseline/                      # non-deployable production schema snapshot
+  migrations/                    # two deployable Phase 2 migrations
+                                 #   (draft_lifecycle + RPC-invariant hardening)
+  tests/                         # SQL/RLS suites + equivalence snapshot
 docs/adr/0001-canonical-composer.md
+docs/adr/0002-draft-lifecycle.md
+docs/security/phase-2-review.md
 THIRD_PARTY_NOTICES.md
 ```
 
@@ -220,17 +255,23 @@ rendered e-mail document root stays LTR (the German business-e-mail default).
 
 ## Excluded features
 
-This phase intentionally does **not** include, and this repository must not
-add:
+Phase 2 adds workspace-scoped persistence through Supabase (Auth + Postgres +
+Storage), so multi-tenant draft storage is now **in** scope. The following
+remain intentionally out of scope, and this repository must not add them:
 
-- authentication, workspaces, or multi-tenant logic;
+- a service-role or any secret Supabase key — the app runs **only** as the
+  authenticated user; every write goes through SECURITY DEFINER RPCs that
+  re-check membership, and direct table DML is revoked (see
+  `docs/security/phase-2-review.md`);
+- sign-in UX / auth-provider configuration (an existing valid session is
+  assumed; unauthenticated calls fail closed with `401`/`404`);
 - e-mail sync, sending, IMAP, SMTP, Gmail, or Microsoft Graph;
 - AI providers, AI SDKs, or any AI-to-action / AI-to-send path;
-- Supabase packages or any production database integration;
 - OCR, tasks, reminders, or notifications;
 - Redis, BullMQ, QStash, Make, or n8n;
 - raw HTML nodes in the editor schema;
-- secrets, API keys, real credentials, or production endpoints.
+- API keys, real credentials, or production endpoints checked into the repo.
 
 GitHub Actions is used for CI checks only — never as an application runtime or
-scheduler.
+scheduler. **Production deployment of the migrations is a separate,
+explicitly approved operational step and is never performed by CI.**

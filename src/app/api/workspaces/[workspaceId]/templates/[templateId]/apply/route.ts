@@ -109,27 +109,25 @@ export async function POST(
   // Checkpoint the current state before replacing it.
   const { error: checkpointError } = await supabase.rpc(RPC.checkpointDraft, {
     p_draft_id: payload.draftId,
+    p_workspace_id: workspaceId,
     p_expected_revision: payload.expectedRevision,
     p_reason: "before_template",
   });
   if (checkpointError) return mapDatabaseError(checkpointError);
 
+  // save_draft records the exact immutable template version used via
+  // p_last_template_version_id; drafts is SELECT-only so there is no direct
+  // trace UPDATE.
   const { data: saved, error: saveError } = await supabase.rpc(RPC.saveDraft, {
     p_draft_id: payload.draftId,
+    p_workspace_id: workspaceId,
     p_expected_revision: payload.expectedRevision,
     p_subject: applied.subject,
     p_body_json: toDbJson(applied.document),
     p_save_reason: "after_template",
+    p_last_template_version_id: payload.templateVersionId,
   });
   if (saveError) return mapDatabaseError(saveError);
-
-  // Traceability: record the exact immutable template version used.
-  const { error: traceError } = await supabase
-    .from("drafts")
-    .update({ last_template_version_id: payload.templateVersionId })
-    .eq("id", payload.draftId)
-    .eq("workspace_id", workspaceId);
-  if (traceError) return mapDatabaseError(traceError);
 
   return Response.json({
     ...(saved as unknown as SaveDraftResult),
