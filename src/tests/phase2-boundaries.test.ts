@@ -112,9 +112,10 @@ describe("deployable migration hygiene", () => {
     const migrations = readdirSync(join(ROOT, "supabase", "migrations")).filter(
       (file) => file.endsWith(".sql"),
     );
-    // Phase 2 draft-lifecycle + Phase 2 RPC hardening + Phase 3A transport;
-    // all must sort after the production tip.
-    expect(migrations.length).toBe(3);
+    // Phase 2 draft-lifecycle + Phase 2 RPC hardening + Phase 3A transport
+    // foundation + Phase 3A transport contract hardening; all must sort after
+    // the production tip.
+    expect(migrations.length).toBe(4);
     for (const file of migrations) {
       const version = file.split("_")[0] ?? "0";
       expect(Number(version)).toBeGreaterThan(20260709182252);
