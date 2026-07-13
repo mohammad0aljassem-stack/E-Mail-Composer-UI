@@ -129,6 +129,13 @@ run_test_suite() {
 echo "Phase 2 + Phase 3A Database Test Runner"
 echo "======================================="
 
+# Fail-closed static gate: the canonical Phase 3 transport contract manifest
+# (supabase/contracts/phase3-transport-contract.json) must be valid and its
+# recorded migration checksums must match the on-disk migrations BEFORE we load
+# and test the chain. Single implementation, shared with CI (pnpm contract:verify).
+echo "Validating canonical transport contract manifest..."
+node scripts/verify-contract-manifest.mjs
+
 if check_existing; then
   echo "Reusing PostgreSQL cluster already running on port $PORT."
 else
