@@ -1017,11 +1017,13 @@ export type Database = {
           created_at: string;
           draft_id: string;
           draft_revision: number;
+          draft_version_id: string | null;
           html_hash: string | null;
           id: string;
           idempotency_key: string;
           mailbox_id: string;
           message_id: string;
+          proof_version: number;
           recipients: Json;
           request_fingerprint: string | null;
           sender: string;
@@ -1040,11 +1042,13 @@ export type Database = {
           created_at?: string;
           draft_id: string;
           draft_revision: number;
+          draft_version_id?: string | null;
           html_hash?: string | null;
           id?: string;
           idempotency_key: string;
           mailbox_id: string;
           message_id: string;
+          proof_version?: number;
           recipients: Json;
           request_fingerprint?: string | null;
           sender: string;
@@ -1063,11 +1067,13 @@ export type Database = {
           created_at?: string;
           draft_id?: string;
           draft_revision?: number;
+          draft_version_id?: string | null;
           html_hash?: string | null;
           id?: string;
           idempotency_key?: string;
           mailbox_id?: string;
           message_id?: string;
+          proof_version?: number;
           recipients?: Json;
           request_fingerprint?: string | null;
           sender?: string;
@@ -1090,6 +1096,13 @@ export type Database = {
             columns: ["draft_id"];
             isOneToOne: false;
             referencedRelation: "drafts";
+            referencedColumns: ["id"];
+          },
+          {
+            foreignKeyName: "send_intents_draft_version_fk";
+            columns: ["draft_version_id"];
+            isOneToOne: false;
+            referencedRelation: "draft_versions";
             referencedColumns: ["id"];
           },
           {
@@ -1511,11 +1524,13 @@ export type Database = {
           created_at: string;
           draft_id: string;
           draft_revision: number;
+          draft_version_id: string | null;
           html_hash: string | null;
           id: string;
           idempotency_key: string;
           mailbox_id: string;
           message_id: string;
+          proof_version: number;
           recipients: Json;
           request_fingerprint: string | null;
           sender: string;
