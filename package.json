@@ -18,6 +18,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:db": "bash scripts/test-db.sh",
+    "contract:verify": "node scripts/verify-contract-manifest.mjs",
     "gen:types": "bash scripts/gen-types.sh",
     "audit:prod": "pnpm audit --prod --audit-level high"
   },
