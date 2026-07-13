@@ -1,0 +1,71 @@
+{
+  "manifestSchemaVersion": 1,
+  "transportContractVersion": 1,
+  "description": "Canonical single source of truth for the Phase 3 transport contract: the immutable Phase 3A migration set (with locked sha256 checksums), the least-privilege worker role, and the function/table/schema privilege boundaries that the loaded migration chain must prove. Contains no UI commit SHA, no secret, and no production identifier.",
+  "migrations": [
+    {
+      "order": 1,
+      "file": "20260713100000_transport_foundation.sql",
+      "sha256": "a2319ada8d471d09063b8e2bfbdb8c814e4ba49cecdee08c9bbd9b800aa8c72a"
+    },
+    {
+      "order": 2,
+      "file": "20260714100000_transport_contract_hardening.sql",
+      "sha256": "ee064f0b50d01897b8247a10edefc95bd0088862e3731693b19da7c851253977"
+    },
+    {
+      "order": 3,
+      "file": "20260715100000_worker_transition_grant.sql",
+      "sha256": "ca15b9de01894ef784fad57f991a052e2da1fcdca435cc1a78463af34b3c0dba"
+    }
+  ],
+  "workerRole": "transport_worker",
+  "requiredFunctionPrivileges": [
+    {
+      "function": "public.phase3_send_attempt_transition_ok(text,text)",
+      "privilege": "EXECUTE",
+      "grantee": "transport_worker"
+    }
+  ],
+  "forbiddenFunctionPrivileges": [
+    {
+      "function": "public.phase3_send_attempt_transition_ok(text,text)",
+      "privilege": "EXECUTE",
+      "grantee": "public"
+    },
+    {
+      "function": "public.phase3_send_attempt_transition_ok(text,text)",
+      "privilege": "EXECUTE",
+      "grantee": "anon"
+    },
+    {
+      "function": "public.phase3_send_attempt_transition_ok(text,text)",
+      "privilege": "EXECUTE",
+      "grantee": "authenticated"
+    }
+  ],
+  "protectedPrivateSchemas": ["transport"],
+  "requiredTablePrivileges": [
+    {
+      "table": "transport.sync_requests",
+      "grantee": "transport_worker",
+      "privileges": ["SELECT", "UPDATE"]
+    }
+  ],
+  "forbiddenTablePrivileges": [
+    {
+      "table": "transport.sync_requests",
+      "grantee": "transport_worker",
+      "privileges": ["INSERT", "DELETE"]
+    }
+  ],
+  "queues": {
+    "sendMessage": { "name": "send_message", "retryLimit": 0 },
+    "syncMailbox": { "name": "sync_mailbox" },
+    "draftMirror": { "name": "draft_mirror" },
+    "applyMutation": { "name": "apply_mutation" }
+  },
+  "featureFlagDefaults": {
+    "MAIL_TRANSPORT_V1_ENABLED": false
+  }
+}
