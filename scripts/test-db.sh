@@ -150,6 +150,13 @@ apply_sql "Re-applying Phase 3A transport migration (idempotency check)" supabas
 # Phase 3A transport contract hardening — additive corrective on top of the above.
 apply_sql "Applying Phase 3A hardening migration" supabase/migrations/20260714100000_transport_contract_hardening.sql
 apply_sql "Re-applying Phase 3A hardening migration (idempotency check)" supabase/migrations/20260714100000_transport_contract_hardening.sql
+# Phase 3A worker transition-validator grant — additive; grants transport_worker
+# EXECUTE on the SECURITY INVOKER trigger's validator. Applied twice to prove
+# idempotency (the grant matrix must be identical after the second apply). The
+# transport_worker role itself is created by the foundation migration above, so
+# it exists before this grant and before the tests that assume the role.
+apply_sql "Applying Phase 3A worker transition grant migration" supabase/migrations/20260715100000_worker_transition_grant.sql
+apply_sql "Re-applying Phase 3A worker transition grant migration (idempotency check)" supabase/migrations/20260715100000_worker_transition_grant.sql
 
 test_dir="supabase/tests/database"
 if [[ ! -d "$test_dir" ]]; then
