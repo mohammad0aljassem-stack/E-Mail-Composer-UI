@@ -145,4 +145,71 @@ begin
   end loop;
 end $$;
 
+-- 5. Transition-validator EXECUTE matrix (added by migration
+--    20260715100000_worker_transition_grant). The send_attempts BEFORE UPDATE
+--    trigger is SECURITY INVOKER, so it calls
+--    public.phase3_send_attempt_transition_ok(text,text) as the worker role that
+--    issued the UPDATE. The canonical schema must therefore grant EXECUTE to
+--    transport_worker (and keep it on service_role), while the browser roles
+--    (public/anon/authenticated) retain NO EXECUTE.
+do $$
+declare
+  v_sig text := 'public.phase3_send_attempt_transition_ok(text, text)';
+begin
+  -- 1. the worker may execute the validator its INVOKER trigger calls.
+  perform public.test_assert(
+    has_function_privilege('transport_worker', v_sig, 'EXECUTE'),
+    'transport_worker may EXECUTE phase3_send_attempt_transition_ok');
+  -- 2. service_role retains EXECUTE (granted by the foundation).
+  perform public.test_assert(
+    has_function_privilege('service_role', v_sig, 'EXECUTE'),
+    'service_role retains EXECUTE on phase3_send_attempt_transition_ok');
+  -- 3-5. browser roles must NOT execute the validator.
+  perform public.test_assert(
+    not has_function_privilege('public', v_sig, 'EXECUTE'),
+    'public may NOT EXECUTE phase3_send_attempt_transition_ok');
+  perform public.test_assert(
+    not has_function_privilege('anon', v_sig, 'EXECUTE'),
+    'anon may NOT EXECUTE phase3_send_attempt_transition_ok');
+  perform public.test_assert(
+    not has_function_privilege('authenticated', v_sig, 'EXECUTE'),
+    'authenticated may NOT EXECUTE phase3_send_attempt_transition_ok');
+end $$;
+
+-- 6. Spot-check: the worker-transition grant migration added NO unexpected
+--    table or schema privilege. A couple of transport tables' worker grants
+--    must be exactly as the foundation/hardening left them, and no new schema
+--    USAGE leaked to the browser roles.
+do $$
+begin
+  -- send_attempts: worker keeps exactly SELECT + UPDATE (no INSERT/DELETE).
+  perform public.test_assert(
+    has_table_privilege('transport_worker', 'public.send_attempts'::regclass, 'SELECT'),
+    'transport_worker still has SELECT on public.send_attempts (unchanged)');
+  perform public.test_assert(
+    has_table_privilege('transport_worker', 'public.send_attempts'::regclass, 'UPDATE'),
+    'transport_worker still has UPDATE on public.send_attempts (unchanged)');
+  perform public.test_assert(
+    not has_table_privilege('transport_worker', 'public.send_attempts'::regclass, 'INSERT'),
+    'transport_worker still has NO INSERT on public.send_attempts (unchanged)');
+  perform public.test_assert(
+    not has_table_privilege('transport_worker', 'public.send_attempts'::regclass, 'DELETE'),
+    'transport_worker still has NO DELETE on public.send_attempts (unchanged)');
+  -- send_intents: worker stays SELECT-only (never UPDATE — proven behaviorally
+  -- in worker_transition_grant.test.sql too).
+  perform public.test_assert(
+    has_table_privilege('transport_worker', 'public.send_intents'::regclass, 'SELECT'),
+    'transport_worker still has SELECT on public.send_intents (unchanged)');
+  perform public.test_assert(
+    not has_table_privilege('transport_worker', 'public.send_intents'::regclass, 'UPDATE'),
+    'transport_worker still has NO UPDATE on public.send_intents (unchanged)');
+  -- no new schema USAGE for the browser roles on the private transport schema.
+  perform public.test_assert(
+    not has_schema_privilege('anon', 'transport', 'USAGE'),
+    'anon still has NO USAGE on schema transport (unchanged)');
+  perform public.test_assert(
+    not has_schema_privilege('authenticated', 'transport', 'USAGE'),
+    'authenticated still has NO USAGE on schema transport (unchanged)');
+end $$;
+
 drop function if exists public.test_assert(boolean, text);
