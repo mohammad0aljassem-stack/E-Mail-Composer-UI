@@ -5,7 +5,7 @@
   metadata, draft mirrors, confirmed send intents, outbound state machine,
   content-free audit) plus the private worker-only schema holding encrypted
   credentials and worker lease/heartbeat rows.
-- Deliverable: two additive migrations applied after the Phase 2 chain
+- Deliverable: three additive migrations applied after the Phase 2 chain
   (`20260711130000_draft_lifecycle` + `20260712100000_enforce_phase2_rpc_invariants`):
   1. `supabase/migrations/20260713100000_transport_foundation.sql` — the merged
      foundation (schema, tables, triggers, RPCs, worker role). **Unchanged**
@@ -16,6 +16,11 @@
      `send_intents.request_fingerprint` column, and re-asserts grants. It fixes
      three contract defects in the foundation (sender authority, durable sync
      requests, strict idempotency — see "Contract hardening" below).
+  3. `supabase/migrations/20260715100000_worker_transition_grant.sql` — a
+     one-line additive, idempotent grant that makes the worker
+     transition-validator `EXECUTE` part of the **canonical** schema (see
+     "Worker transition-validator grant" below). It adds **no** table, schema, or
+     role privilege and performs **no** SECURITY DEFINER conversion.
 - Production status: **still disabled.** Neither migration has been applied to
   production (prod tip remains `20260709182252`; Phase 2 itself is not deployed
   yet). This is local-only schema work; the lead integrates.
@@ -238,6 +243,63 @@ idempotency-key hit:
 as-is; the table is new/empty in practice, so every real row carries a
 fingerprint and divergence is caught strictly.)
 
+## Worker transition-validator grant (migration `20260715100000`)
+
+**Defect.** `transport_worker` drives the outbound state machine by issuing
+`UPDATE public.send_attempts` (it holds exactly `SELECT,UPDATE` on that table).
+Every such UPDATE fires the BEFORE UPDATE trigger
+`public.phase3_send_attempts_before_update()`, which is declared **`SECURITY
+INVOKER`** and calls the authoritative transition-table validator
+`public.phase3_send_attempt_transition_ok(text, text)`. Because the trigger is
+INVOKER, that validator runs with the privileges of the **calling role** — the
+worker — not the trigger owner. The foundation migration (`20260713100000`)
+revoked EXECUTE on the validator from public/anon/authenticated and granted it
+**only to `service_role`**. So a least-privilege production `transport_worker`
+could UPDATE `send_attempts`, but the INVOKER trigger's validator call failed
+with `permission denied for function phase3_send_attempt_transition_ok` — every
+legal worker transition was blocked. (A test-only `GRANT … TO transport_worker`
+in the backend repo papered over this; that workaround is being removed. It was
+**never** present in this UI repo's runner or SQL suites.)
+
+**Fix.** The additive, idempotent migration grants EXECUTE on **exactly** that
+one validator to `transport_worker`, making the privilege part of the canonical
+schema rather than a manual or test-only step:
+
+```sql
+revoke execute on function public.phase3_send_attempt_transition_ok(text, text)
+  from public, anon, authenticated;   -- defense in depth; already revoked
+grant  execute on function public.phase3_send_attempt_transition_ok(text, text)
+  to transport_worker;
+```
+
+It deliberately does **not**: grant EXECUTE to public/anon/authenticated; add
+any table or schema privilege; grant broad EXECUTE on all functions;
+create/alter any role or add a login/password; or convert the validator or
+trigger to `SECURITY DEFINER`. The trigger stays `SECURITY INVOKER` with an
+empty `search_path` and fully-qualified calls; the authoritative transition
+table, terminal-state protection, version-rollback protection, and
+workspace/intent immutability are all unchanged. The only change is that the
+calling worker role may now execute the validator the trigger already invokes on
+its behalf.
+
+**Production provisioning is still separate.** The grant applies to the
+`transport_worker` role once it exists; provisioning the worker **LOGIN** role
+(assigning a login secret / rotating the KMS data key / seeding real
+credentials) remains a deliberate out-of-band manual op, exactly as for the
+`NOLOGIN` role the foundation creates (see "Production provisioning is a separate
+manual op"). Nothing here is applied to production.
+
+**Tested** (`worker_transition_grant.test.sql` + additions to
+`transport_grant_matrix.test.sql`): the validator EXECUTE matrix (worker +
+service_role yes; public/anon/authenticated no); that the grant added no
+unexpected table/schema privilege; and **real** `set local role
+transport_worker` behavior against an isolated fixture — a legal transition
+succeeds **with no test-only grant present** (the migration is the sole source
+of the privilege), an illegal transition fails `23514`, terminal states stay
+terminal, version rollback fails, `workspace_id`/`send_intent_id` are immutable,
+the worker cannot UPDATE `send_intents`, and the browser role still cannot UPDATE
+`send_attempts`; plus re-apply idempotency of the grant matrix.
+
 ## Why credentials never reach the browser (summary)
 
 1. They live in schema `transport`, which the browser role cannot access
@@ -262,10 +324,20 @@ deployment enables it.
 
 ## Test coverage
 
-- `transport_grant_matrix.test.sql` — 194 assertions: full 4-role × **11-table**
+- `transport_grant_matrix.test.sql` — 207 assertions: full 4-role × **11-table**
   × 4-privilege matrix (now including `transport.sync_requests`), schema
-  USAGE/CREATE, RPC EXECUTE matrix, and SECURITY DEFINER + pinned `search_path`
-  on both RPCs.
+  USAGE/CREATE, RPC EXECUTE matrix, SECURITY DEFINER + pinned `search_path` on
+  both RPCs, plus the **transition-validator EXECUTE matrix** (worker +
+  service_role yes; public/anon/authenticated no) and spot-checks that the
+  worker grant added no unexpected table/schema privilege.
+- `worker_transition_grant.test.sql` — 13 assertions: REAL `set local role
+transport_worker` state-machine behavior against an isolated fixture (legal
+  transition + field-only update succeed via the INVOKER trigger's validator
+  call, illegal transition/version-rollback/terminal-state/immutability all
+  rejected with `23514`, worker cannot UPDATE `send_intents` and the browser
+  cannot UPDATE `send_attempts` — both `42501`), that the validator EXECUTE comes
+  from the canonical migration (not the harness), and grant-matrix re-apply
+  idempotency.
 - `transport_rls.test.sql` — 35 assertions: happy-path `create_send_intent`
   (server-generated message_id/proof/idempotency, seeded attempt + audit,
   idempotent replay), cross-workspace isolation, direct-write denial (42501),
@@ -287,6 +359,8 @@ deployment enables it.
   transport_worker exactly SELECT+UPDATE, service_role ALL).
 
 The runner `scripts/test-db.sh` applies the full chain (baseline → Phase 2 ×2 →
-Phase 3 foundation ×2 → Phase 3 hardening ×2), re-applies each migration to prove
-idempotency, runs all suites (**574 SQL assertions total**), and keeps the
-Phase 2 three-path equivalence check intact.
+Phase 3 foundation ×2 → Phase 3 hardening ×2 → Phase 3 worker-transition grant
+×2), re-applies each migration to prove idempotency, runs all suites (**600 SQL
+assertions total**), and keeps the Phase 2 three-path equivalence check intact.
+The runner adds **no** `GRANT EXECUTE … TO transport_worker` of its own — the
+worker's validator EXECUTE originates solely from migration `20260715100000`.
