@@ -1099,11 +1099,21 @@ export type Database = {
             referencedColumns: ["id"];
           },
           {
-            foreignKeyName: "send_intents_draft_version_fk";
-            columns: ["draft_version_id"];
+            foreignKeyName: "send_intents_draft_version_identity_fk";
+            columns: [
+              "draft_version_id",
+              "workspace_id",
+              "draft_id",
+              "draft_revision",
+            ];
             isOneToOne: false;
             referencedRelation: "draft_versions";
-            referencedColumns: ["id"];
+            referencedColumns: [
+              "id",
+              "workspace_id",
+              "draft_id",
+              "source_revision",
+            ];
           },
           {
             foreignKeyName: "send_intents_mailbox_id_fkey";
