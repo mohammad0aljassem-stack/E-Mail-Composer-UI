@@ -26,7 +26,7 @@
     {
       "order": 5,
       "file": "20260717100000_send_mime_artifacts.sql",
-      "sha256": "90ad8911bd89d7fdf3774e1a8387fccfeac7f52bd4bd45aba2b6ea978c161b78"
+      "sha256": "25fb351e2eb4fd66e90116d621db35f2a86cd44a9ebf74b0408f3f578ecc8b4a"
     }
   ],
   "workerRole": "transport_worker",
@@ -142,7 +142,8 @@
   "rawMimeMaxBytes": 26214400,
   "invariants": {
     "sendIntentExactSnapshot": "Every send intent is created at contract_version 2 / proof_version 2 (create_send_intent rejects any other value) with the locked draft subject/body/revision as sole authority, and is bound atomically at confirm time to an immutable draft_versions snapshot by a COMPOSITE identity foreign key (draft_version_id, workspace_id, draft_id, draft_revision) -> draft_versions (id, workspace_id, draft_id, source_revision), DEFERRABLE INITIALLY DEFERRED, ON DELETE NO ACTION — proving the snapshot's exact workspace/draft/revision, not mere existence, while still permitting full workspace/draft graph deletion. Legacy proof_version-1 intents (NULL draft_version_id) are non-sendable fail-closed (transport.get_send_snapshot raises a uniform P0002). The worker reads confirmed content only through the private snapshot functions — draft_versions has no worker table grant.",
-    "mimeArtifactImmutability": "transport.send_mime_artifacts rows are created ONLY via transport.create_or_verify_send_mime_artifact while the send attempt is in state 'claimed' (before smtp_in_progress); the worker has no direct INSERT. The function verifies sha256(raw_mime) = mime_sha256, exact size, the attempt/intent/workspace/message_id chain, and the 25 MiB bound; an existing artifact is returned only on exact identity (bytes/hash/size/message_id), never overwritten. Rows are immutable except the single retention-clearing transition (raw_mime -> NULL + cleared_at stamped, all metadata byte-identical).",
+    "mimeArtifactImmutability": "transport.send_mime_artifacts rows are created ONLY via transport.create_or_verify_send_mime_artifact while the send attempt is in state 'claimed' (before smtp_in_progress); the worker has no direct INSERT. The function verifies sha256(raw_mime) = mime_sha256, exact size, the attempt/intent/workspace/message_id chain, and the 25 MiB bound; an existing artifact is returned only on exact identity, and the caller's supplied bytes are ALWAYS re-hashed (encode(sha256(p_raw_mime)) = stored mime_sha256, octet_length = stored size_bytes) on every call INCLUDING after retention clearing, so a cleared row can never be verified with forged bytes. Rows are immutable except the single retention-clearing transition (raw_mime -> NULL + cleared_at stamped, all metadata byte-identical).",
+    "artifactBeforeSmtp": "A send attempt may transition claimed -> smtp_in_progress only when exactly one valid, retained MIME artifact already exists for that exact attempt and immutable send intent (matching send_attempt_id/send_intent_id/workspace_id/message_id, raw_mime present and un-cleared, size in (0, 26214400], octet_length = size_bytes, and sha256(raw_mime) re-verified = mime_sha256). Enforced by the BEFORE UPDATE OF state trigger trg_send_attempts_require_mime_before_smtp on public.send_attempts (23514 otherwise, attempt stays claimed) so SMTP can never begin without durably persisted bytes.",
     "mimeArtifactRetention": "Raw MIME bytes may be cleared only after the attempt is completed/failed_before_delivery/cancelled; mime_sha256, size_bytes and message_id survive clearing as the durable proof; payloads are bounded by rawMimeMaxBytes (25 MiB) and never reachable by browser roles."
   },
   "queues": {

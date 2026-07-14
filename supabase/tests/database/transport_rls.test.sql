@@ -266,6 +266,13 @@ begin
 
   -- terminal state: completed accepts no further transition
   update public.send_attempts set state = 'claimed', version = version + 1 where id = v_attempt;
+  -- Persist the exact MIME artifact before SMTP (the artifact-before-smtp_in_progress guard requires it).
+  perform transport.create_or_verify_send_mime_artifact(
+    a.id, a.send_intent_id, a.workspace_id, a.message_id,
+    encode(sha256(convert_to('mime:' || a.id::text, 'UTF8')), 'hex'),
+    octet_length(convert_to('mime:' || a.id::text, 'UTF8')),
+    convert_to('mime:' || a.id::text, 'UTF8'))
+  from public.send_attempts a where a.id = v_attempt;
   update public.send_attempts set state = 'smtp_in_progress', version = version + 1 where id = v_attempt;
   update public.send_attempts set state = 'smtp_accepted', version = version + 1 where id = v_attempt;
   update public.send_attempts set state = 'completed', version = version + 1 where id = v_attempt;
