@@ -38,6 +38,11 @@
 --      artifact exists; once it does the transition succeeds. The guard does NOT
 --      fire on claimed -> failed_before_delivery / cancelled / needs_human_review
 --      (all work with no artifact). A hash-mismatched artifact can never exist.
+--   8. CLEARED-ROW VERIFY — after retention clearing (raw_mime NULL) the
+--      create-or-verify path ALWAYS re-hashes the caller's actual p_raw_mime
+--      against the stored durable digest/size: forged bytes carrying the stale
+--      declared hash/size, a NULL p_raw_mime, or a wrong-size payload are 23514;
+--      the ORIGINAL bytes still verify the cleared row.
 --
 -- Runs inside a single rolled-back transaction; leaves no rows behind.
 -- Distinct UUIDs (7777-based) avoid colliding with the other suites' seeds.
@@ -112,7 +117,8 @@ begin
     ('gfbd',    'mime gfbd'),      -- C1: claimed->failed_before_delivery works w/o artifact
     ('gcanc',   'mime gcanc'),     -- C1: claimed->cancelled works w/o artifact
     ('gnhr',    'mime gnhr'),      -- C1: claimed->needs_human_review works w/o artifact
-    ('gmis',    'mime gmis')       -- C1: a hash-mismatched artifact can never exist
+    ('gmis',    'mime gmis'),      -- C1: a hash-mismatched artifact can never exist
+    ('clrver',  'mime clrver')     -- C2: cleared-row verify re-hashes the caller's bytes
   ) v(k, subj)
   loop
     d := public.create_draft('7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', rec.subj,
@@ -923,6 +929,73 @@ begin
   perform public.test_assert(got='23514',
     format('guard: an artifact whose stored mime_sha256 != sha256(raw_mime) cannot exist (23514, got %s)', got));
 end $$;
+
+-- =====================================================================
+-- 8. CLEARED-ROW VERIFY RE-HASHES THE CALLER'S BYTES (Correction 2). After
+--    retention clearing (raw_mime NULL) the verify path must STILL prove the
+--    caller holds the exact bytes by re-hashing p_raw_mime against the stored
+--    durable digest/size — echoing the old declared hash/size is NOT enough
+--    (the defect let a cleared row verify against arbitrary bytes).
+-- =====================================================================
+set local role transport_worker;
+do $$
+declare
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_a uuid := (select val from t_ctx where key='attempt_clrver')::uuid;
+  v_i uuid := (select val from t_ctx where key='intent_clrver')::uuid;
+  v_msg text := (select val from t_ctx where key='msgid_clrver');
+  v_ws uuid := '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  v_id uuid;
+  v_b2 bytea := convert_to('tampered post-clear bytes payload', 'UTF8');  -- sha != v_sha
+  v_diffsize bytea := convert_to('short', 'UTF8');                        -- octet_length != v_len
+  r transport.send_mime_artifacts;
+  got text;
+begin
+  -- set up: create the artifact while claimed, drive to completed, clear bytes.
+  perform pg_temp.drive_to(v_a, 'claimed');
+  v_id := (transport.create_or_verify_send_mime_artifact(v_a, v_i, v_ws, v_msg, v_sha, v_len, v_raw)).id;
+  perform pg_temp.drive_to(v_a, 'completed');
+  update transport.send_mime_artifacts set raw_mime = null, cleared_at = now() where id = v_id;
+  select * into r from transport.send_mime_artifacts where id = v_id;
+  perform public.test_assert(r.raw_mime is null and r.cleared_at is not null,
+    'cleared-verify: fixture artifact is cleared (raw gone) before the verify checks');
+
+  -- (1) SAME refs + declared H + declared S but DIFFERENT bytes (sha != H):
+  --     this WRONGLY succeeded on a cleared row before the fix; now 23514.
+  got := null;
+  begin
+    perform transport.create_or_verify_send_mime_artifact(v_a, v_i, v_ws, v_msg, v_sha, v_len, v_b2);
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('cleared-verify: same declared hash/size but forged bytes is rejected 23514 (got %s)', got));
+
+  -- (2) ORIGINAL bytes (sha=H, size=S) verify the cleared row successfully.
+  r := transport.create_or_verify_send_mime_artifact(v_a, v_i, v_ws, v_msg, v_sha, v_len, v_raw);
+  perform public.test_assert(r.id = v_id and r.raw_mime is null and r.cleared_at is not null,
+    'cleared-verify: the ORIGINAL bytes verify the cleared row (returns it, still cleared)');
+
+  -- (3) p_raw_mime NULL is rejected 23514 (the caller must present the bytes).
+  got := null;
+  begin
+    perform transport.create_or_verify_send_mime_artifact(v_a, v_i, v_ws, v_msg, v_sha, v_len, null);
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('cleared-verify: a NULL p_raw_mime is rejected 23514 (got %s)', got));
+
+  -- (4) Bytes of a DIFFERENT size fail the octet_length re-check: 23514.
+  got := null;
+  begin
+    perform transport.create_or_verify_send_mime_artifact(v_a, v_i, v_ws, v_msg, v_sha, v_len, v_diffsize);
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('cleared-verify: bytes of a different size are rejected 23514 (got %s)', got));
+end $$;
+reset role;
 
 -- =====================================================================
 -- 5. CONTENT HYGIENE — the audit trail can never carry raw MIME

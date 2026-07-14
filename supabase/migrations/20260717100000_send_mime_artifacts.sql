@@ -252,16 +252,27 @@ begin
 
   if found then
     -- 4. RESTART / RECONCILIATION VERIFY PATH. Permitted regardless of the
-    -- attempt's current state, but the args must match the stored identity
-    -- EXACTLY. The raw bytes are compared ONLY while still present (a cleared
-    -- row keeps identity on its durable metadata: hash/size/message_id/refs).
-    -- Any divergence -> uniform 23514. Existing bytes are NEVER overwritten.
+    -- attempt's current state, but the caller must PROVE it still holds the
+    -- exact bytes — cleared or not. The load-bearing defect fix (defect: a
+    -- cleared row, raw_mime IS NULL, must NOT be verifiable by merely echoing
+    -- the old declared hash/size): the caller's ACTUAL p_raw_mime is ALWAYS
+    -- re-hashed and re-sized against the stored DURABLE metadata
+    -- (v_existing.mime_sha256 / v_existing.size_bytes), so a caller submitting
+    -- arbitrary bytes with the stale declared digest can never get a false
+    -- verify. We ALSO require the caller's declared p_mime_sha256/p_size_bytes to
+    -- equal the stored values and the ref fields to match, and — as defence in
+    -- depth while the bytes are still retained — that p_raw_mime equals the
+    -- stored raw_mime byte-for-byte. Any divergence -> uniform 23514. Existing
+    -- bytes are NEVER overwritten.
     if v_existing.send_attempt_id is distinct from p_send_attempt_id
        or v_existing.send_intent_id is distinct from p_send_intent_id
        or v_existing.workspace_id is distinct from p_workspace_id
        or v_existing.message_id is distinct from p_message_id
        or v_existing.mime_sha256 is distinct from p_mime_sha256
        or v_existing.size_bytes is distinct from p_size_bytes
+       or p_raw_mime is null
+       or encode(sha256(p_raw_mime), 'hex') is distinct from v_existing.mime_sha256
+       or octet_length(p_raw_mime) is distinct from v_existing.size_bytes
        or (v_existing.raw_mime is not null and v_existing.raw_mime is distinct from p_raw_mime) then
       raise exception 'send MIME artifact verify failed' using errcode = '23514';
     end if;
@@ -304,7 +315,7 @@ begin
 end;
 $$;
 comment on function transport.create_or_verify_send_mime_artifact(uuid, uuid, uuid, text, text, bigint, bytea) is
-  'Phase 3B (PRIVATE, SECURITY DEFINER): the worker''s ONLY creation path for send_mime_artifacts (the worker holds NO direct INSERT). Locks the attempt row FOR UPDATE (serializing concurrent identical calls; unique(send_attempt_id) backstops). If no artifact exists it FIRST-CREATES one, but only while the attempt is EXACTLY ''claimed'' and every bound relationship + the exact-bytes hash/size/25MiB-bound hold. If an artifact already exists it VERIFIES identity for the restart/reconciliation path — permitted regardless of the current attempt state, requiring an EXACT match on send_attempt_id/send_intent_id/workspace_id/message_id/mime_sha256/size_bytes (and raw_mime while still present), and NEVER overwriting existing bytes; a cleared row still verifies on its durable metadata. Every rejection is a UNIFORM, non-disclosing 23514. EXECUTE: transport_worker + service_role only.';
+  'Phase 3B (PRIVATE, SECURITY DEFINER): the worker''s ONLY creation path for send_mime_artifacts (the worker holds NO direct INSERT). Locks the attempt row FOR UPDATE (serializing concurrent identical calls; unique(send_attempt_id) backstops). If no artifact exists it FIRST-CREATES one, but only while the attempt is EXACTLY ''claimed'' and every bound relationship + the exact-bytes hash/size/25MiB-bound hold. If an artifact already exists it VERIFIES identity for the restart/reconciliation path — permitted regardless of the current attempt state, requiring an EXACT match on send_attempt_id/send_intent_id/workspace_id/message_id/mime_sha256/size_bytes AND that the caller''s ACTUAL p_raw_mime is ALWAYS re-hashed and re-sized against the stored durable digest/size (cleared or not — a cleared row keeps mime_sha256/size_bytes, so a caller must still prove it holds the exact bytes), plus a byte-for-byte compare while raw_mime is still retained; it NEVER overwrites existing bytes. Every rejection is a UNIFORM, non-disclosing 23514. EXECUTE: transport_worker + service_role only.';
 
 -- Creation is worker-only through this function; browsers can never call it.
 revoke all on function transport.create_or_verify_send_mime_artifact(uuid, uuid, uuid, text, text, bigint, bytea)
