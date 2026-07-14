@@ -164,6 +164,17 @@ apply_sql "Re-applying Phase 3A hardening migration (idempotency check)" supabas
 # it exists before this grant and before the tests that assume the role.
 apply_sql "Applying Phase 3A worker transition grant migration" supabase/migrations/20260715100000_worker_transition_grant.sql
 apply_sql "Re-applying Phase 3A worker transition grant migration (idempotency check)" supabase/migrations/20260715100000_worker_transition_grant.sql
+# Phase 3B confirmed send snapshots — additive; binds every new send intent to an
+# immutable draft_versions snapshot of the exact confirmed content (proof v2) and
+# adds the private worker-only snapshot accessors. Applied twice to prove
+# idempotency (drop-then-re-add of the widened reason CHECK is a no-op-equivalent).
+apply_sql "Applying Phase 3B confirmed snapshots migration" supabase/migrations/20260716100000_confirmed_send_snapshots.sql
+apply_sql "Re-applying Phase 3B confirmed snapshots migration (idempotency check)" supabase/migrations/20260716100000_confirmed_send_snapshots.sql
+# Phase 3B MIME artifacts — additive; the private worker-owned exact-MIME
+# evidence table with its insert/clearing integrity triggers. Applied twice to
+# prove idempotency.
+apply_sql "Applying Phase 3B MIME artifacts migration" supabase/migrations/20260717100000_send_mime_artifacts.sql
+apply_sql "Re-applying Phase 3B MIME artifacts migration (idempotency check)" supabase/migrations/20260717100000_send_mime_artifacts.sql
 
 test_dir="supabase/tests/database"
 if [[ ! -d "$test_dir" ]]; then

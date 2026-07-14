@@ -14,7 +14,7 @@
 //
 // Load-bearing guarantees enforced here:
 //   1. manifestSchemaVersion is present and supported (=== 1).
-//   2. transportContractVersion is supported (=== 1).
+//   2. transportContractVersion is supported (=== 2).
 //   3. Every listed migration file exists under supabase/migrations/.
 //   4. Every listed migration's on-disk sha256 EXACTLY matches the manifest
 //      value. A mismatch FAILS and demands review — the checksum is never
@@ -22,7 +22,7 @@
 //   5. Manifest migration order matches lexicographic filename order, orders
 //      are 1..N contiguous, and no file is listed twice.
 //   6. No Phase 3 transport migration on disk (version >= 20260713100000) is
-//      absent from the manifest, and the three known Phase 3A migrations are
+//      absent from the manifest, and the known Phase 3A/3B migrations are
 //      all listed.
 // ============================================================================
 
@@ -43,14 +43,16 @@ const MIGRATIONS_DIR = join(REPO_ROOT, "supabase", "migrations");
 // Boundary version for the Phase 3 transport migration set. Any migration
 // whose version prefix is >= this MUST be listed in the manifest.
 const PHASE3_MIN_VERSION = 20260713100000n;
-// The three known, immutable Phase 3A migrations that must always be listed.
+// The known, immutable Phase 3 migrations that must always be listed.
 const KNOWN_PHASE3_FILES = [
   "20260713100000_transport_foundation.sql",
   "20260714100000_transport_contract_hardening.sql",
   "20260715100000_worker_transition_grant.sql",
+  "20260716100000_confirmed_send_snapshots.sql",
+  "20260717100000_send_mime_artifacts.sql",
 ];
 const SUPPORTED_MANIFEST_SCHEMA_VERSION = 1;
-const SUPPORTED_TRANSPORT_CONTRACT_VERSION = 1;
+const SUPPORTED_TRANSPORT_CONTRACT_VERSION = 2;
 
 const errors = [];
 const fail = (msg) => errors.push(msg);
@@ -186,10 +188,10 @@ for (const file of onDisk) {
     );
   }
 }
-// The three known Phase 3A migrations must always be listed.
+// The known Phase 3A/3B migrations must always be listed.
 for (const known of KNOWN_PHASE3_FILES) {
   if (!seen.has(known)) {
-    fail(`required Phase 3A migration missing from the manifest: ${known}.`);
+    fail(`required Phase 3 migration missing from the manifest: ${known}.`);
   }
 }
 

@@ -112,8 +112,8 @@ begin
     v_draft, v_rev,
     'ops@w1.example.com',
     '{"to":["dest@example.com"],"cc":[],"bcc":[]}'::jsonb,
-    'Hello', null, null, '[]'::jsonb,
-    null, null, 1, 'idem-key-1');
+    'send me', null, null, '[]'::jsonb,
+    null, null, 2, 'idem-key-1');
   insert into t_ctx values ('intent', i.id::text);
 
   perform public.test_assert(i.id is not null, 'create_send_intent returns the inserted intent');
@@ -149,8 +149,8 @@ begin
     'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
     'cccccccc-cccc-cccc-cccc-ccccccccccc1',
     v_draft, v_rev, 'ops@w1.example.com',
-    '{"to":["dest@example.com"],"cc":[],"bcc":[]}'::jsonb, 'Hello', null, null, '[]'::jsonb,
-    null, null, 1, 'idem-key-1');
+    '{"to":["dest@example.com"],"cc":[],"bcc":[]}'::jsonb, 'send me', null, null, '[]'::jsonb,
+    null, null, 2, 'idem-key-1');
   perform public.test_assert(i.id = v_intent, 'idempotent replay returns the original intent');
   select count(*) into n from public.send_intents where idempotency_key = 'idem-key-1';
   perform public.test_assert(n = 1, 'no duplicate intent is created on idempotent replay');
@@ -266,6 +266,13 @@ begin
 
   -- terminal state: completed accepts no further transition
   update public.send_attempts set state = 'claimed', version = version + 1 where id = v_attempt;
+  -- Persist the exact MIME artifact before SMTP (the artifact-before-smtp_in_progress guard requires it).
+  perform transport.create_or_verify_send_mime_artifact(
+    a.id, a.send_intent_id, a.workspace_id, a.message_id,
+    encode(sha256(convert_to('mime:' || a.id::text, 'UTF8')), 'hex'),
+    octet_length(convert_to('mime:' || a.id::text, 'UTF8')),
+    convert_to('mime:' || a.id::text, 'UTF8'))
+  from public.send_attempts a where a.id = v_attempt;
   update public.send_attempts set state = 'smtp_in_progress', version = version + 1 where id = v_attempt;
   update public.send_attempts set state = 'smtp_accepted', version = version + 1 where id = v_attempt;
   update public.send_attempts set state = 'completed', version = version + 1 where id = v_attempt;
@@ -291,7 +298,7 @@ begin
       'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
       'cccccccc-cccc-cccc-cccc-ccccccccccc1',
       v_draft, 1, 'ops@w1.example.com', '{"to":["x@y.z"]}'::jsonb,
-      'x', null, null, '[]'::jsonb, null, null, 1, 'idem-c-attempt');
+      'send me', null, null, '[]'::jsonb, null, null, 2, 'idem-c-attempt');
     raise exception 'non-member created a send_intent' using errcode = 'ASSRT';
   exception when sqlstate 'P0002' then
     perform public.test_assert(true, 'non-member of W1 gets P0002 from create_send_intent');
@@ -360,7 +367,7 @@ begin
       'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
       'cccccccc-cccc-cccc-cccc-ccccccccccc1',
       v_draft, v_rev, 'ops@w1.example.com', '{"to":["x@y.z"]}'::jsonb,
-      'x', null, null, '[]'::jsonb, null, null, 1, 'idem-killed');
+      'send me', null, null, '[]'::jsonb, null, null, 2, 'idem-killed');
     raise exception 'create_send_intent ran with kill switch engaged' using errcode = 'ASSRT';
   exception when sqlstate '55000' then
     perform public.test_assert(true, 'kill switch blocks create_send_intent (55000)');

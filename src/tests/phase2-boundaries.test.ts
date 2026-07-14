@@ -114,8 +114,9 @@ describe("deployable migration hygiene", () => {
     );
     // Phase 2 draft-lifecycle + Phase 2 RPC hardening + Phase 3A transport
     // foundation + Phase 3A transport contract hardening + Phase 3A worker
-    // transition-validator grant; all must sort after the production tip.
-    expect(migrations.length).toBe(5);
+    // transition-validator grant + Phase 3B confirmed send snapshots + Phase 3B
+    // MIME artifacts; all must sort after the production tip.
+    expect(migrations.length).toBe(7);
     for (const file of migrations) {
       const version = file.split("_")[0] ?? "0";
       expect(Number(version)).toBeGreaterThan(20260709182252);
