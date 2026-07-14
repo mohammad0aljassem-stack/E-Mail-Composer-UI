@@ -1,26 +1,37 @@
 -- ============================================================================
--- Phase 3B database tests — private exact MIME artifacts
+-- Phase 3B database tests — private exact MIME artifacts (Phase 4 hardened)
 --
 -- Plain-SQL tests (no pgTAP). Run with: psql -v ON_ERROR_STOP=1 -f <this>
 -- against a database with the full migration chain (through 20260717100000)
 -- applied. Any uncaught exception makes psql exit non-zero. Each passing
 -- assertion emits: NOTICE ok - <message>.
 --
--- Proven here:
---   1. WORKER WRITE PATH — transport_worker inserts a valid artifact whose
---      sha256/size are verified against the exact raw bytes and whose
---      attempt/intent/workspace/message_id chain must be consistent (each
---      mismatch: 23514; wrong size / oversize: 23514 check violations;
---      duplicate per attempt: 23505 — the worker repository's idempotent
---      handling of an identical replay is its INSERT ... ON CONFLICT path).
---   2. BROWSER DENIAL — anon/authenticated cannot SELECT/INSERT/UPDATE/DELETE
---      the artifact table at all (42501; no schema USAGE, no table privilege).
+-- Proven here (the corrected Phase 4 contract):
+--   1. ATOMIC CREATE-OR-VERIFY — transport.create_or_verify_send_mime_artifact
+--      is the worker's ONLY creation path. A FIRST create succeeds only while the
+--      attempt is EXACTLY 'claimed'; first-create in every other state
+--      (confirmed/queued/smtp_in_progress/smtp_accepted/sent_copy_pending/
+--      completed/needs_human_review/cancelled) fails 23514. A second call with an
+--      artifact already present is the restart/reconciliation VERIFY path: an
+--      EXACT-identity replay succeeds (returns the existing row, no overwrite)
+--      REGARDLESS of the attempt state; any divergence (bytes/hash/size/
+--      message_id/workspace/intent) or an oversize fails 23514. Two identical
+--      sequential calls return the same id (the attempt-row FOR UPDATE lock +
+--      unique(send_attempt_id) make concurrent identical creation safe).
+--   2. LEAST PRIVILEGE — the worker holds NO INSERT (direct INSERT => 42501) and
+--      NO DELETE (=> 42501); it creates exclusively through the DEFINER function.
+--      anon/authenticated cannot SELECT/INSERT/UPDATE/DELETE the table and cannot
+--      EXECUTE the function (42501). The BEFORE INSERT trigger's state gate +
+--      chain checks fire even for a DIRECT privileged (superuser) INSERT.
 --   3. IMMUTABILITY + RETENTION — any UPDATE other than the single clearing
 --      transition is 23514; clearing is refused (23514) while the attempt is
---      smtp_in_progress / needs_human_review / sent_copy_pending and succeeds
---      once the attempt is completed, preserving mime_sha256/size_bytes/
---      message_id; the worker holds NO DELETE.
---   4. CONTENT HYGIENE — public.transport_audit has no bytea column and this
+--      smtp_in_progress / smtp_accepted / sent_copy_pending / needs_human_review
+--      and succeeds once the attempt is completed / cancelled /
+--      failed_before_delivery, preserving mime_sha256/size_bytes/message_id/refs;
+--      the worker holds NO DELETE.
+--   4. GRAPH DELETION — a full workspace cascade removes the derived artifact
+--      (the parent attempt/intent/workspace FKs are ON DELETE CASCADE).
+--   5. CONTENT HYGIENE — public.transport_audit has no bytea column and this
 --      suite's raw MIME marker never appears in any audit row.
 --
 -- Runs inside a single rolled-back transaction; leaves no rows behind.
@@ -52,15 +63,16 @@ create temporary table t_ctx (key text primary key, val text) on commit drop;
 grant all on table t_ctx to public;
 
 -- ---------------------------------------------------------------------------
--- Fixture (superuser): Uma = member of WS-A; WS-B exists only as a foreign
--- workspace for the mismatch test. Two intents (each with its seeded
--- 'confirmed' attempt) are created via the real RPCs.
+-- Fixture (superuser): Uma = owner of WS-A; a single enabled mailbox. Every
+-- intent below is created via the real contract-v2 RPC (contract_version=2 and
+-- a subject that EXACTLY equals the draft's subject — the Slice-1 authority),
+-- each seeding its own 'confirmed' send_attempt. One intent/attempt per test
+-- axis so no attempt is reused after it grows an artifact.
 -- ---------------------------------------------------------------------------
 insert into auth.users (id, email, raw_user_meta_data) values
   ('77771111-1111-1111-1111-111111111111', 'uma@example.com', '{"full_name":"Uma"}');
 insert into public.workspaces (id, name) values
-  ('7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Artifact Workspace A'),
-  ('7777bbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'Artifact Workspace B');
+  ('7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'Artifact Workspace A');
 insert into public.workspace_members (workspace_id, user_id, role) values
   ('7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '77771111-1111-1111-1111-111111111111', 'owner');
 insert into public.mailboxes (id, workspace_id, email_address, enabled, created_by) values
@@ -70,29 +82,42 @@ insert into public.mailboxes (id, workspace_id, email_address, enabled, created_
 select set_config('request.jwt.claims',
   '{"sub":"77771111-1111-1111-1111-111111111111","role":"authenticated"}', true);
 set local role authenticated;
+-- One draft + one send_intent per axis key. The RPC requires contract_version=2
+-- and p_subject == the created draft's subject.
 do $$
 declare
-  d1 public.drafts; d2 public.drafts;
-  i1 public.send_intents; i2 public.send_intents;
-  a1 uuid; a2 uuid;
+  rec record;
+  d public.drafts;
+  i public.send_intents;
+  a uuid;
 begin
-  d1 := public.create_draft('7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'mime one', public.test_doc('body one'));
-  i1 := public.create_send_intent(
-    '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '7777cccc-cccc-cccc-cccc-ccccccccccc1',
-    d1.id, d1.revision, 'ops@w7.example.com',
-    '{"to":["one@example.com"],"cc":[],"bcc":[]}'::jsonb,
-    'mime one', null, null, '[]'::jsonb, null, null, 1, 'mime-idem-1');
-  d2 := public.create_draft('7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'mime two', public.test_doc('body two'));
-  i2 := public.create_send_intent(
-    '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '7777cccc-cccc-cccc-cccc-ccccccccccc1',
-    d2.id, d2.revision, 'ops@w7.example.com',
-    '{"to":["two@example.com"],"cc":[],"bcc":[]}'::jsonb,
-    'mime two', null, null, '[]'::jsonb, null, null, 1, 'mime-idem-2');
-  select id into a1 from public.send_attempts where send_intent_id = i1.id;
-  select id into a2 from public.send_attempts where send_intent_id = i2.id;
-  insert into t_ctx values
-    ('intent1', i1.id::text), ('attempt1', a1::text), ('msgid1', i1.message_id),
-    ('intent2', i2.id::text), ('attempt2', a2::text), ('msgid2', i2.message_id);
+  for rec in select * from (values
+    ('a1',      'mime a1'),        -- success + divergence + replay + clearing->completed
+    ('conc',    'mime conc'),      -- sequential double-call is safe
+    ('nhr',     'mime nhr'),       -- clearing blocked in needs_human_review
+    ('clrcanc', 'mime clrcanc'),   -- clearing allowed in cancelled
+    ('clrfbd',  'mime clrfbd'),    -- clearing allowed in failed_before_delivery
+    ('big',     'mime big'),       -- oversize first-create
+    ('states',  'mime states'),    -- first-create fails in 6 non-claimed states
+    ('nhr2',    'mime nhr2'),      -- first-create fails in needs_human_review
+    ('canc',    'mime canc'),      -- first-create fails in cancelled
+    ('dgate',   'mime dgate'),     -- direct privileged INSERT: state-gate + chain
+    ('dok',     'mime dok')        -- direct privileged INSERT: valid + duplicate
+  ) v(k, subj)
+  loop
+    d := public.create_draft('7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', rec.subj,
+                             public.test_doc('body ' || rec.k));
+    i := public.create_send_intent(
+      '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '7777cccc-cccc-cccc-cccc-ccccccccccc1',
+      d.id, d.revision, 'ops@w7.example.com',
+      '{"to":["dest@example.com"],"cc":[],"bcc":[]}'::jsonb,
+      rec.subj, null, null, '[]'::jsonb, null, null, 2, 'mime-idem-' || rec.k);
+    select id into a from public.send_attempts where send_intent_id = i.id;
+    insert into t_ctx values
+      ('intent_'  || rec.k, i.id::text),
+      ('attempt_' || rec.k, a::text),
+      ('msgid_'   || rec.k, i.message_id);
+  end loop;
 end $$;
 reset role;
 
@@ -101,9 +126,9 @@ reset role;
 do $$
 declare v_raw bytea := convert_to(
   'MIME-Version: 1.0' || chr(13) || chr(10) ||
-  'Subject: mime one' || chr(13) || chr(10) ||
+  'Subject: mime a1' || chr(13) || chr(10) ||
   'X-Test-Marker: PHASE3B-RAW-MIME-MARKER' || chr(13) || chr(10) ||
-  chr(13) || chr(10) || 'body one', 'UTF8');
+  chr(13) || chr(10) || 'body a1', 'UTF8');
 begin
   insert into t_ctx values
     ('raw_hex', encode(v_raw, 'hex')),
@@ -111,249 +136,360 @@ begin
     ('raw_len', octet_length(v_raw)::text);
 end $$;
 
+-- Helper: advance an attempt FORWARD along the real happy path to a target state
+-- (reads the current state, so it is safe to call repeatedly / from any earlier
+-- point; a no-op if already at/past the target). Branch targets
+-- (needs_human_review / failed_before_delivery / cancelled) are reached off
+-- 'claimed'. Every step is a legal transition through the SECURITY INVOKER
+-- BEFORE UPDATE trigger, driven by whatever role calls this (worker or superuser).
+create or replace function pg_temp.drive_to(p_attempt uuid, p_target text)
+returns void language plpgsql as $$
+declare
+  path text[] := array['confirmed','queued','claimed','smtp_in_progress',
+                        'smtp_accepted','sent_copy_pending','completed'];
+  cur text; cur_idx int; tgt_idx int; i int;
+begin
+  if p_target in ('needs_human_review','failed_before_delivery','cancelled') then
+    perform pg_temp.drive_to(p_attempt, 'claimed');
+    update public.send_attempts set state = p_target, version = version + 1 where id = p_attempt;
+    return;
+  end if;
+  select state into cur from public.send_attempts where id = p_attempt;
+  cur_idx := array_position(path, cur);
+  tgt_idx := array_position(path, p_target);
+  if cur_idx is null or tgt_idx is null then
+    raise exception 'drive_to: unsupported transition % -> %', cur, p_target;
+  end if;
+  i := cur_idx;
+  while i < tgt_idx loop
+    update public.send_attempts set state = path[i + 1], version = version + 1 where id = p_attempt;
+    i := i + 1;
+  end loop;
+end;
+$$;
+grant execute on function pg_temp.drive_to(uuid, text) to public;
+
 -- =====================================================================
--- 1. WORKER WRITE PATH (set role transport_worker; no test-only grant)
+-- 1. ATOMIC CREATE-OR-VERIFY (the worker's only creation path)
 -- =====================================================================
 set local role transport_worker;
 
--- 1a. A fully consistent artifact inserts and reads back exactly.
+-- 1a. First-create in 'claimed' succeeds and stores the exact bytes.
 do $$
 declare
-  v_raw bytea := decode((select val from t_ctx where key = 'raw_hex'), 'hex');
-  v_sha text := (select val from t_ctx where key = 'raw_sha');
-  v_len bigint := (select val from t_ctx where key = 'raw_len')::bigint;
-  v_a1 uuid := (select val from t_ctx where key = 'attempt1')::uuid;
-  v_i1 uuid := (select val from t_ctx where key = 'intent1')::uuid;
-  v_msg text := (select val from t_ctx where key = 'msgid1');
-  v_id uuid;
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_a uuid := (select val from t_ctx where key='attempt_a1')::uuid;
+  v_i uuid := (select val from t_ctx where key='intent_a1')::uuid;
+  v_msg text := (select val from t_ctx where key='msgid_a1');
   r transport.send_mime_artifacts;
 begin
-  insert into transport.send_mime_artifacts
-    (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
-  values
-    (v_a1, v_i1, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg, v_sha, v_len, v_raw)
-  returning id into v_id;
-  perform public.test_assert(v_id is not null, 'worker: a valid exact-MIME artifact inserts');
-  select * into r from transport.send_mime_artifacts where id = v_id;
+  perform pg_temp.drive_to(v_a, 'claimed');
+  r := transport.create_or_verify_send_mime_artifact(
+    v_a, v_i, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg, v_sha, v_len, v_raw);
+  perform public.test_assert(r.id is not null,
+    'create/verify: first-create while claimed returns an artifact');
   perform public.test_assert(r.raw_mime = v_raw and r.mime_sha256 = v_sha and r.size_bytes = v_len,
-    'worker: the stored artifact carries the exact bytes, sha256 and size');
+    'create/verify: the stored artifact carries the exact bytes, sha256 and size');
   perform public.test_assert(r.cleared_at is null,
-    'worker: a fresh artifact is not cleared');
-  insert into t_ctx values ('artifact1', v_id::text);
+    'create/verify: a fresh artifact is not cleared');
+  insert into t_ctx values ('artifact_a1', r.id::text);
 end $$;
 
--- 1b. Mismatched workspace (intent lives in WS-A, row claims WS-B) => 23514.
+-- 1b. Divergent args on the VERIFY path each fail 23514 (existing a1 artifact).
+--     Every non-target field matches the stored row so exactly one axis diverges.
 do $$
 declare
-  v_raw bytea := decode((select val from t_ctx where key = 'raw_hex'), 'hex');
-  v_sha text := (select val from t_ctx where key = 'raw_sha');
-  v_len bigint := (select val from t_ctx where key = 'raw_len')::bigint;
-  v_a2 uuid := (select val from t_ctx where key = 'attempt2')::uuid;
-  v_i2 uuid := (select val from t_ctx where key = 'intent2')::uuid;
-  v_msg2 text := (select val from t_ctx where key = 'msgid2');
-  got text := null;
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_a uuid := (select val from t_ctx where key='attempt_a1')::uuid;
+  v_i uuid := (select val from t_ctx where key='intent_a1')::uuid;
+  v_msg text := (select val from t_ctx where key='msgid_a1');
+  v_ws uuid := '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  got text;
 begin
+  -- divergent bytes (same declared hash/size/msgid, different raw)
+  got := null;
   begin
-    insert into transport.send_mime_artifacts
-      (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
-    values
-      (v_a2, v_i2, '7777bbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', v_msg2, v_sha, v_len, v_raw);
+    perform transport.create_or_verify_send_mime_artifact(
+      v_a, v_i, v_ws, v_msg, v_sha, v_len, convert_to('different bytes entirely', 'UTF8'));
     got := 'no-error';
-  exception
-    when sqlstate '23514' then got := '23514';
-    when others then got := sqlstate;
-  end;
-  perform public.test_assert(got = '23514',
-    format('worker: a workspace mismatch is rejected with 23514 (got %s)', got));
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('create/verify: divergent raw bytes are rejected 23514 (got %s)', got));
+
+  -- divergent hash
+  got := null;
+  begin
+    perform transport.create_or_verify_send_mime_artifact(
+      v_a, v_i, v_ws, v_msg, repeat('0',64), v_len, v_raw);
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('create/verify: divergent mime_sha256 is rejected 23514 (got %s)', got));
+
+  -- divergent size
+  got := null;
+  begin
+    perform transport.create_or_verify_send_mime_artifact(
+      v_a, v_i, v_ws, v_msg, v_sha, v_len + 1, v_raw);
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('create/verify: divergent size_bytes is rejected 23514 (got %s)', got));
+
+  -- divergent message_id
+  got := null;
+  begin
+    perform transport.create_or_verify_send_mime_artifact(
+      v_a, v_i, v_ws, '<forged@w7.example.com>', v_sha, v_len, v_raw);
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('create/verify: divergent message_id is rejected 23514 (got %s)', got));
+
+  -- divergent workspace
+  got := null;
+  begin
+    perform transport.create_or_verify_send_mime_artifact(
+      v_a, v_i, '7777bbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', v_msg, v_sha, v_len, v_raw);
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('create/verify: divergent workspace_id is rejected 23514 (got %s)', got));
+
+  -- divergent intent
+  got := null;
+  begin
+    perform transport.create_or_verify_send_mime_artifact(
+      v_a, '7777dddd-dddd-dddd-dddd-dddddddddddd', v_ws, v_msg, v_sha, v_len, v_raw);
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('create/verify: divergent send_intent_id is rejected 23514 (got %s)', got));
 end $$;
 
--- 1c. Mismatched intent (attempt2 claimed against intent1) => 23514.
+-- 1c. Identical replay in 'claimed' returns the SAME row and never overwrites.
 do $$
 declare
-  v_raw bytea := decode((select val from t_ctx where key = 'raw_hex'), 'hex');
-  v_sha text := (select val from t_ctx where key = 'raw_sha');
-  v_len bigint := (select val from t_ctx where key = 'raw_len')::bigint;
-  v_a2 uuid := (select val from t_ctx where key = 'attempt2')::uuid;
-  v_i1 uuid := (select val from t_ctx where key = 'intent1')::uuid;
-  v_msg text := (select val from t_ctx where key = 'msgid1');
-  got text := null;
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_a uuid := (select val from t_ctx where key='attempt_a1')::uuid;
+  v_i uuid := (select val from t_ctx where key='intent_a1')::uuid;
+  v_msg text := (select val from t_ctx where key='msgid_a1');
+  v_art uuid := (select val from t_ctx where key='artifact_a1')::uuid;
+  r transport.send_mime_artifacts;
 begin
-  begin
-    insert into transport.send_mime_artifacts
-      (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
-    values
-      (v_a2, v_i1, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg, v_sha, v_len, v_raw);
-    got := 'no-error';
-  exception
-    when sqlstate '23514' then got := '23514';
-    when others then got := sqlstate;
-  end;
-  perform public.test_assert(got = '23514',
-    format('worker: an attempt belonging to another intent is rejected with 23514 (got %s)', got));
+  r := transport.create_or_verify_send_mime_artifact(
+    v_a, v_i, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg, v_sha, v_len, v_raw);
+  perform public.test_assert(r.id = v_art,
+    'create/verify: an identical replay while claimed returns the existing artifact');
+  perform public.test_assert(r.raw_mime = v_raw and r.cleared_at is null,
+    'create/verify: replay never overwrites — bytes still present, not cleared');
 end $$;
 
--- 1d. Mismatched message_id => 23514.
+-- 1d. Two identical SEQUENTIAL calls on a fresh claimed attempt return one id
+--     (the FOR UPDATE lock + unique(send_attempt_id) make concurrent create safe).
 do $$
 declare
-  v_raw bytea := decode((select val from t_ctx where key = 'raw_hex'), 'hex');
-  v_sha text := (select val from t_ctx where key = 'raw_sha');
-  v_len bigint := (select val from t_ctx where key = 'raw_len')::bigint;
-  v_a2 uuid := (select val from t_ctx where key = 'attempt2')::uuid;
-  v_i2 uuid := (select val from t_ctx where key = 'intent2')::uuid;
-  got text := null;
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_a uuid := (select val from t_ctx where key='attempt_conc')::uuid;
+  v_i uuid := (select val from t_ctx where key='intent_conc')::uuid;
+  v_msg text := (select val from t_ctx where key='msgid_conc');
+  r1 transport.send_mime_artifacts; r2 transport.send_mime_artifacts;
 begin
-  begin
-    insert into transport.send_mime_artifacts
-      (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
-    values
-      (v_a2, v_i2, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '<forged@w7.example.com>', v_sha, v_len, v_raw);
-    got := 'no-error';
-  exception
-    when sqlstate '23514' then got := '23514';
-    when others then got := sqlstate;
-  end;
-  perform public.test_assert(got = '23514',
-    format('worker: a message_id differing from the intent''s is rejected with 23514 (got %s)', got));
+  perform pg_temp.drive_to(v_a, 'claimed');
+  r1 := transport.create_or_verify_send_mime_artifact(
+    v_a, v_i, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg, v_sha, v_len, v_raw);
+  r2 := transport.create_or_verify_send_mime_artifact(
+    v_a, v_i, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg, v_sha, v_len, v_raw);
+  perform public.test_assert(r1.id = r2.id,
+    'create/verify: two identical sequential calls return the same id (concurrent-safe)');
 end $$;
 
--- 1e. Wrong size (bytes present but size_bytes off by one) => 23514 check.
+-- 1e. First-create FAILS (23514) in every non-'claimed' state. The 'states'
+--     attempt walks confirmed->queued->[claimed, skipped]->smtp_in_progress->
+--     smtp_accepted->sent_copy_pending->completed WITHOUT ever creating, so the
+--     function keeps hitting the first-create state gate.
 do $$
 declare
-  v_raw bytea := decode((select val from t_ctx where key = 'raw_hex'), 'hex');
-  v_sha text := (select val from t_ctx where key = 'raw_sha');
-  v_len bigint := (select val from t_ctx where key = 'raw_len')::bigint;
-  v_a2 uuid := (select val from t_ctx where key = 'attempt2')::uuid;
-  v_i2 uuid := (select val from t_ctx where key = 'intent2')::uuid;
-  v_msg2 text := (select val from t_ctx where key = 'msgid2');
-  got text := null;
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_a uuid := (select val from t_ctx where key='attempt_states')::uuid;
+  v_i uuid := (select val from t_ctx where key='intent_states')::uuid;
+  v_msg text := (select val from t_ctx where key='msgid_states');
+  v_ws uuid := '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  got text;
+  st text;
 begin
-  begin
-    insert into transport.send_mime_artifacts
-      (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
-    values
-      (v_a2, v_i2, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg2, v_sha, v_len + 1, v_raw);
-    got := 'no-error';
-  exception
-    when sqlstate '23514' then got := '23514';
-    when others then got := sqlstate;
-  end;
-  perform public.test_assert(got = '23514',
-    format('worker: a size_bytes not matching octet_length(raw_mime) is rejected with 23514 (got %s)', got));
+  foreach st in array array['confirmed','queued','smtp_in_progress','smtp_accepted','sent_copy_pending','completed']
+  loop
+    -- advance forward to st (walks THROUGH claimed without ever creating)
+    perform pg_temp.drive_to(v_a, st);
+    got := null;
+    begin
+      perform transport.create_or_verify_send_mime_artifact(v_a, v_i, v_ws, v_msg, v_sha, v_len, v_raw);
+      got := 'no-error';
+    exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+    perform public.test_assert(got='23514',
+      format('create/verify: first-create while attempt is %s is rejected 23514 (got %s)', st, got));
+  end loop;
 end $$;
 
--- 1f. Wrong hash (valid hex, wrong digest) => 23514.
+-- 1f. First-create FAILS in needs_human_review and in cancelled (terminal
+--     branches off claimed / confirmed) — separate attempts.
 do $$
 declare
-  v_raw bytea := decode((select val from t_ctx where key = 'raw_hex'), 'hex');
-  v_len bigint := (select val from t_ctx where key = 'raw_len')::bigint;
-  v_a2 uuid := (select val from t_ctx where key = 'attempt2')::uuid;
-  v_i2 uuid := (select val from t_ctx where key = 'intent2')::uuid;
-  v_msg2 text := (select val from t_ctx where key = 'msgid2');
-  got text := null;
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_ws uuid := '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  got text;
 begin
+  -- needs_human_review
+  perform pg_temp.drive_to((select val from t_ctx where key='attempt_nhr2')::uuid, 'needs_human_review');
+  got := null;
   begin
-    insert into transport.send_mime_artifacts
-      (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
-    values
-      (v_a2, v_i2, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg2, repeat('0', 64), v_len, v_raw);
+    perform transport.create_or_verify_send_mime_artifact(
+      (select val from t_ctx where key='attempt_nhr2')::uuid,
+      (select val from t_ctx where key='intent_nhr2')::uuid,
+      v_ws, (select val from t_ctx where key='msgid_nhr2'), v_sha, v_len, v_raw);
     got := 'no-error';
-  exception
-    when sqlstate '23514' then got := '23514';
-    when others then got := sqlstate;
-  end;
-  perform public.test_assert(got = '23514',
-    format('worker: a mime_sha256 not matching sha256(raw_mime) is rejected with 23514 (got %s)', got));
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('create/verify: first-create while needs_human_review is rejected 23514 (got %s)', got));
+
+  -- cancelled
+  perform pg_temp.drive_to((select val from t_ctx where key='attempt_canc')::uuid, 'cancelled');
+  got := null;
+  begin
+    perform transport.create_or_verify_send_mime_artifact(
+      (select val from t_ctx where key='attempt_canc')::uuid,
+      (select val from t_ctx where key='intent_canc')::uuid,
+      v_ws, (select val from t_ctx where key='msgid_canc'), v_sha, v_len, v_raw);
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('create/verify: first-create while cancelled is rejected 23514 (got %s)', got));
 end $$;
 
--- 1g. Oversized payload (26214401 bytes, hash and size otherwise exact) =>
---     23514 (the 25 MiB size_bytes bound).
+-- 1g. Oversized first-create (26214401 bytes, hash + octet_length exact) fails
+--     23514 — the 25 MiB bound is enforced in the function before any insert.
 do $$
 declare
   v_big bytea := convert_to(repeat('x', 26214401), 'UTF8');
-  v_a2 uuid := (select val from t_ctx where key = 'attempt2')::uuid;
-  v_i2 uuid := (select val from t_ctx where key = 'intent2')::uuid;
-  v_msg2 text := (select val from t_ctx where key = 'msgid2');
+  v_a uuid := (select val from t_ctx where key='attempt_big')::uuid;
+  v_i uuid := (select val from t_ctx where key='intent_big')::uuid;
+  v_msg text := (select val from t_ctx where key='msgid_big');
   got text := null;
 begin
+  perform pg_temp.drive_to(v_a, 'claimed');
   begin
-    insert into transport.send_mime_artifacts
-      (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
-    values
-      (v_a2, v_i2, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg2,
-       encode(sha256(v_big), 'hex'), octet_length(v_big), v_big);
+    perform transport.create_or_verify_send_mime_artifact(
+      v_a, v_i, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg,
+      encode(sha256(v_big),'hex'), octet_length(v_big)::bigint, v_big);
     got := 'no-error';
-  exception
-    when sqlstate '23514' then got := '23514';
-    when others then got := sqlstate;
-  end;
-  perform public.test_assert(got = '23514',
-    format('worker: a payload over 26214400 bytes is rejected with 23514 (got %s)', got));
-end $$;
-
--- 1h. A second artifact for the SAME attempt => unique violation 23505. The
---     worker repository handles an identical idempotent replay via its
---     INSERT ... ON CONFLICT (send_attempt_id) DO NOTHING path; at the schema
---     level a duplicate is always a conflict.
-do $$
-declare
-  v_raw bytea := decode((select val from t_ctx where key = 'raw_hex'), 'hex');
-  v_sha text := (select val from t_ctx where key = 'raw_sha');
-  v_len bigint := (select val from t_ctx where key = 'raw_len')::bigint;
-  v_a1 uuid := (select val from t_ctx where key = 'attempt1')::uuid;
-  v_i1 uuid := (select val from t_ctx where key = 'intent1')::uuid;
-  v_msg text := (select val from t_ctx where key = 'msgid1');
-  got text := null;
-begin
-  begin
-    insert into transport.send_mime_artifacts
-      (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
-    values
-      (v_a1, v_i1, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg, v_sha, v_len, v_raw);
-    got := 'no-error';
-  exception
-    when unique_violation then got := '23505';
-    when others then got := sqlstate;
-  end;
-  perform public.test_assert(got = '23505',
-    format('worker: a duplicate artifact for the same attempt is a unique violation 23505 (got %s)', got));
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('create/verify: an oversized (>26214400) payload is rejected 23514 (got %s)', got));
 end $$;
 
 reset role;
 
 -- =====================================================================
--- 2. BROWSER DENIAL — anon/authenticated have ZERO reach (42501)
+-- 2. LEAST PRIVILEGE — worker has NO direct INSERT/DELETE; browser has ZERO
+--    reach and cannot EXECUTE the creation function.
 -- =====================================================================
+
+-- 2a. transport_worker cannot DIRECTLY INSERT (no INSERT grant => 42501): it may
+--     only create through the DEFINER function.
+set local role transport_worker;
+do $$
+declare
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_a uuid := (select val from t_ctx where key='attempt_dok')::uuid;
+  v_i uuid := (select val from t_ctx where key='intent_dok')::uuid;
+  v_msg text := (select val from t_ctx where key='msgid_dok');
+begin
+  perform pg_temp.drive_to(v_a, 'claimed');
+  begin
+    insert into transport.send_mime_artifacts
+      (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
+    values (v_a, v_i, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg, v_sha, v_len, v_raw);
+    raise exception 'worker directly INSERTed send_mime_artifacts' using errcode = 'ASSRT';
+  exception when insufficient_privilege then
+    perform public.test_assert(true,
+      'least-privilege: transport_worker cannot DIRECTLY INSERT send_mime_artifacts (42501)');
+  end;
+end $$;
+
+-- 2b. transport_worker cannot DELETE (no DELETE grant => 42501). (a1 exists.)
+do $$
+declare v_art uuid := (select val from t_ctx where key='artifact_a1')::uuid;
+begin
+  begin
+    delete from transport.send_mime_artifacts where id = v_art;
+    raise exception 'worker DELETEd send_mime_artifacts' using errcode = 'ASSRT';
+  exception when insufficient_privilege then
+    perform public.test_assert(true,
+      'least-privilege: transport_worker cannot DELETE send_mime_artifacts (42501)');
+  end;
+end $$;
+reset role;
+
+-- 2c. Browser (authenticated) has ZERO table reach and cannot EXECUTE the
+--     creation function (no schema USAGE / no EXECUTE => 42501).
 select set_config('request.jwt.claims',
   '{"sub":"77771111-1111-1111-1111-111111111111","role":"authenticated"}', true);
 set local role authenticated;
 do $$
-declare v_art uuid := (select val from t_ctx where key = 'artifact1')::uuid;
+declare
+  v_art uuid := (select val from t_ctx where key='artifact_a1')::uuid;
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_msg text := (select val from t_ctx where key='msgid_a1');
 begin
   begin
     perform 1 from transport.send_mime_artifacts limit 1;
     raise exception 'authenticated SELECTed send_mime_artifacts' using errcode = 'ASSRT';
   exception when insufficient_privilege then
-    perform public.test_assert(true, 'browser: authenticated cannot SELECT transport.send_mime_artifacts (42501)');
+    perform public.test_assert(true, 'browser: authenticated cannot SELECT send_mime_artifacts (42501)');
   end;
   begin
     insert into transport.send_mime_artifacts
       (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
-    values (v_art, v_art, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '<x@y>', repeat('0', 64), 1, '\x00');
+    values (v_art, v_art, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '<x@y>', repeat('0',64), 1, '\x00');
     raise exception 'authenticated INSERTed send_mime_artifacts' using errcode = 'ASSRT';
   exception when insufficient_privilege then
-    perform public.test_assert(true, 'browser: authenticated cannot INSERT transport.send_mime_artifacts (42501)');
+    perform public.test_assert(true, 'browser: authenticated cannot INSERT send_mime_artifacts (42501)');
   end;
   begin
     update transport.send_mime_artifacts set cleared_at = now() where id = v_art;
     raise exception 'authenticated UPDATEd send_mime_artifacts' using errcode = 'ASSRT';
   exception when insufficient_privilege then
-    perform public.test_assert(true, 'browser: authenticated cannot UPDATE transport.send_mime_artifacts (42501)');
+    perform public.test_assert(true, 'browser: authenticated cannot UPDATE send_mime_artifacts (42501)');
   end;
   begin
     delete from transport.send_mime_artifacts where id = v_art;
     raise exception 'authenticated DELETEd send_mime_artifacts' using errcode = 'ASSRT';
   exception when insufficient_privilege then
-    perform public.test_assert(true, 'browser: authenticated cannot DELETE transport.send_mime_artifacts (42501)');
+    perform public.test_assert(true, 'browser: authenticated cannot DELETE send_mime_artifacts (42501)');
+  end;
+  begin
+    perform transport.create_or_verify_send_mime_artifact(
+      v_art, v_art, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg, v_sha, v_len, v_raw);
+    raise exception 'authenticated EXECUTEd create_or_verify_send_mime_artifact' using errcode = 'ASSRT';
+  exception when insufficient_privilege then
+    perform public.test_assert(true, 'browser: authenticated cannot EXECUTE the creation function (42501)');
   end;
 end $$;
 reset role;
@@ -365,13 +501,21 @@ begin
     perform 1 from transport.send_mime_artifacts limit 1;
     raise exception 'anon SELECTed send_mime_artifacts' using errcode = 'ASSRT';
   exception when insufficient_privilege then
-    perform public.test_assert(true, 'browser: anon cannot SELECT transport.send_mime_artifacts (42501)');
+    perform public.test_assert(true, 'browser: anon cannot SELECT send_mime_artifacts (42501)');
+  end;
+  begin
+    perform transport.create_or_verify_send_mime_artifact(
+      '00000000-0000-0000-0000-000000000000','00000000-0000-0000-0000-000000000000',
+      '00000000-0000-0000-0000-000000000000','<x@y>', repeat('0',64), 1, '\x00');
+    raise exception 'anon EXECUTEd create_or_verify_send_mime_artifact' using errcode = 'ASSRT';
+  exception when insufficient_privilege then
+    perform public.test_assert(true, 'browser: anon cannot EXECUTE the creation function (42501)');
   end;
 end $$;
 reset role;
 
--- Catalog matrix: worker exactly SELECT+INSERT+UPDATE; browser roles nothing;
--- service_role all.
+-- 2d. Catalog matrix: worker exactly SELECT+UPDATE (NEVER INSERT/DELETE); browser
+--     roles nothing; service_role all.
 do $$
 declare r record; expected boolean; actual boolean;
 begin
@@ -384,182 +528,293 @@ begin
     expected := case
       when r.role = 'service_role' then true
       when r.role in ('anon','authenticated') then false
-      else r.priv in ('SELECT','INSERT','UPDATE')   -- transport_worker: never DELETE
+      else r.priv in ('SELECT','UPDATE')   -- transport_worker: never INSERT/DELETE
     end;
     perform public.test_assert(actual = expected,
-      format('artifact privilege: %s %s on transport.send_mime_artifacts = %s', r.role, r.priv, expected));
+      format('artifact privilege: %s %s on send_mime_artifacts = %s', r.role, r.priv, expected));
   end loop;
 end $$;
 
+-- 2e. Function EXECUTE matrix: worker + service_role only; browser roles never.
+do $$
+declare
+  v_sig text := 'transport.create_or_verify_send_mime_artifact(uuid, uuid, uuid, text, text, bigint, bytea)';
+begin
+  perform public.test_assert(has_function_privilege('transport_worker', v_sig, 'EXECUTE'),
+    'function privilege: transport_worker may EXECUTE create_or_verify_send_mime_artifact');
+  perform public.test_assert(has_function_privilege('service_role', v_sig, 'EXECUTE'),
+    'function privilege: service_role may EXECUTE create_or_verify_send_mime_artifact');
+  perform public.test_assert(not has_function_privilege('anon', v_sig, 'EXECUTE'),
+    'function privilege: anon may NOT EXECUTE create_or_verify_send_mime_artifact');
+  perform public.test_assert(not has_function_privilege('authenticated', v_sig, 'EXECUTE'),
+    'function privilege: authenticated may NOT EXECUTE create_or_verify_send_mime_artifact');
+  perform public.test_assert(not has_function_privilege('public', v_sig, 'EXECUTE'),
+    'function privilege: public may NOT EXECUTE create_or_verify_send_mime_artifact');
+end $$;
+
 -- =====================================================================
--- 3. IMMUTABILITY + RETENTION (worker drives the real state machine)
+-- 3. DIRECT PRIVILEGED INSERT still passes through the BEFORE INSERT trigger
+--    (superuser: bypasses grants, NOT triggers/constraints). Proves the state
+--    gate + parent-chain checks + one-per-attempt protect even a direct insert.
+-- =====================================================================
+
+-- 3a. State gate: a direct privileged INSERT for a non-'claimed' (confirmed)
+--     attempt is rejected 23514 by the trigger.
+do $$
+declare
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_a uuid := (select val from t_ctx where key='attempt_dgate')::uuid;   -- still 'confirmed'
+  v_i uuid := (select val from t_ctx where key='intent_dgate')::uuid;
+  v_msg text := (select val from t_ctx where key='msgid_dgate');
+  got text := null;
+begin
+  begin
+    insert into transport.send_mime_artifacts
+      (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
+    values (v_a, v_i, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg, v_sha, v_len, v_raw);
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('direct insert: the claimed-state gate rejects a confirmed-attempt insert 23514 (got %s)', got));
+end $$;
+
+-- 3b. Chain checks (claimed 'dok' attempt): bad hash / wrong workspace / wrong
+--     message_id each 23514; then a valid insert succeeds; a duplicate is 23505.
+do $$
+declare
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_a uuid := (select val from t_ctx where key='attempt_dok')::uuid;   -- driven to claimed in 2a
+  v_i uuid := (select val from t_ctx where key='intent_dok')::uuid;
+  v_msg text := (select val from t_ctx where key='msgid_dok');
+  v_ws uuid := '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  got text; v_id uuid;
+begin
+  -- bad hash (valid hex, wrong digest)
+  got := null;
+  begin
+    insert into transport.send_mime_artifacts
+      (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
+    values (v_a, v_i, v_ws, v_msg, repeat('0',64), v_len, v_raw);
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('direct insert: a mime_sha256 not matching sha256(raw_mime) is rejected 23514 (got %s)', got));
+
+  -- wrong workspace
+  got := null;
+  begin
+    insert into transport.send_mime_artifacts
+      (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
+    values (v_a, v_i, '7777bbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', v_msg, v_sha, v_len, v_raw);
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('direct insert: a workspace mismatch is rejected 23514 (got %s)', got));
+
+  -- wrong message_id
+  got := null;
+  begin
+    insert into transport.send_mime_artifacts
+      (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
+    values (v_a, v_i, v_ws, '<forged@w7.example.com>', v_sha, v_len, v_raw);
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('direct insert: a message_id differing from the intent is rejected 23514 (got %s)', got));
+
+  -- valid direct privileged insert succeeds while claimed
+  insert into transport.send_mime_artifacts
+    (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
+  values (v_a, v_i, v_ws, v_msg, v_sha, v_len, v_raw)
+  returning id into v_id;
+  perform public.test_assert(v_id is not null,
+    'direct insert: a valid privileged insert while claimed succeeds (trigger allows)');
+
+  -- duplicate for the same attempt is a unique violation (23505)
+  got := null;
+  begin
+    insert into transport.send_mime_artifacts
+      (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
+    values (v_a, v_i, v_ws, v_msg, v_sha, v_len, v_raw);
+    got := 'no-error';
+  exception when unique_violation then got := '23505'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23505',
+    format('direct insert: a duplicate artifact for the same attempt is 23505 (got %s)', got));
+end $$;
+
+-- =====================================================================
+-- 4. IMMUTABILITY + RETENTION (worker drives the real state machine)
 -- =====================================================================
 set local role transport_worker;
 
--- 3a. Any non-clearing UPDATE is rejected: divergent raw_mime replacement
---     (even with a matching hash/size for the NEW bytes) and metadata edits.
+-- 4a. Any non-clearing UPDATE is rejected 23514 (raw-byte replacement + metadata
+--     edit), even with a self-consistent hash/size for the NEW bytes.
 do $$
 declare
-  v_art uuid := (select val from t_ctx where key = 'artifact1')::uuid;
+  v_art uuid := (select val from t_ctx where key='artifact_a1')::uuid;
   v_new bytea := convert_to('tampered replacement bytes', 'UTF8');
   got text := null;
 begin
   begin
     update transport.send_mime_artifacts
-      set raw_mime = v_new,
-          mime_sha256 = encode(sha256(v_new), 'hex'),
-          size_bytes = octet_length(v_new)
+      set raw_mime = v_new, mime_sha256 = encode(sha256(v_new),'hex'), size_bytes = octet_length(v_new)
       where id = v_art;
     got := 'no-error';
-  exception
-    when sqlstate '23514' then got := '23514';
-    when others then got := sqlstate;
-  end;
-  perform public.test_assert(got = '23514',
-    format('immutability: replacing the raw bytes via UPDATE is rejected with 23514 (got %s)', got));
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('immutability: replacing the raw bytes via UPDATE is rejected 23514 (got %s)', got));
   got := null;
   begin
     update transport.send_mime_artifacts set message_id = '<other@w7.example.com>' where id = v_art;
     got := 'no-error';
-  exception
-    when sqlstate '23514' then got := '23514';
-    when others then got := sqlstate;
-  end;
-  perform public.test_assert(got = '23514',
-    format('immutability: editing artifact metadata via UPDATE is rejected with 23514 (got %s)', got));
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('immutability: editing artifact metadata via UPDATE is rejected 23514 (got %s)', got));
 end $$;
 
--- 3b. Clearing is refused while the attempt is smtp_in_progress (23514).
+-- 4b. Clearing is REFUSED (23514) and identical replay SUCCEEDS at each
+--     non-terminal delivery state as a1 advances claimed->smtp_in_progress->
+--     smtp_accepted->sent_copy_pending. Bytes stay present the whole way.
 do $$
 declare
-  v_a1 uuid := (select val from t_ctx where key = 'attempt1')::uuid;
-  v_art uuid := (select val from t_ctx where key = 'artifact1')::uuid;
-  got text := null;
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_a uuid := (select val from t_ctx where key='attempt_a1')::uuid;
+  v_i uuid := (select val from t_ctx where key='intent_a1')::uuid;
+  v_msg text := (select val from t_ctx where key='msgid_a1');
+  v_art uuid := (select val from t_ctx where key='artifact_a1')::uuid;
+  v_ws uuid := '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  st text; got text; r transport.send_mime_artifacts;
 begin
-  update public.send_attempts set state = 'queued',           version = version + 1 where id = v_a1;
-  update public.send_attempts set state = 'claimed',          version = version + 1 where id = v_a1;
-  update public.send_attempts set state = 'smtp_in_progress', version = version + 1 where id = v_a1;
-  begin
-    update transport.send_mime_artifacts set raw_mime = null, cleared_at = now() where id = v_art;
-    got := 'no-error';
-  exception
-    when sqlstate '23514' then got := '23514';
-    when others then got := sqlstate;
-  end;
-  perform public.test_assert(got = '23514',
-    format('retention: clearing while the attempt is smtp_in_progress is rejected with 23514 (got %s)', got));
+  foreach st in array array['smtp_in_progress','smtp_accepted','sent_copy_pending']
+  loop
+    perform pg_temp.drive_to(v_a, st);
+    -- replay verify succeeds regardless of state
+    r := transport.create_or_verify_send_mime_artifact(v_a, v_i, v_ws, v_msg, v_sha, v_len, v_raw);
+    perform public.test_assert(r.id = v_art and r.raw_mime = v_raw,
+      format('retention: identical replay while %s returns the same artifact (no overwrite)', st));
+    -- clearing is refused
+    got := null;
+    begin
+      update transport.send_mime_artifacts set raw_mime = null, cleared_at = now() where id = v_art;
+      got := 'no-error';
+    exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+    perform public.test_assert(got='23514',
+      format('retention: clearing while the attempt is %s is rejected 23514 (got %s)', st, got));
+  end loop;
 end $$;
 
--- 3c. Clearing is refused while the attempt is sent_copy_pending (23514).
+-- 4c. Clearing is REFUSED (23514) while needs_human_review (separate attempt with
+--     its own function-created artifact).
 do $$
 declare
-  v_a1 uuid := (select val from t_ctx where key = 'attempt1')::uuid;
-  v_art uuid := (select val from t_ctx where key = 'artifact1')::uuid;
-  got text := null;
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_a uuid := (select val from t_ctx where key='attempt_nhr')::uuid;
+  v_i uuid := (select val from t_ctx where key='intent_nhr')::uuid;
+  v_msg text := (select val from t_ctx where key='msgid_nhr');
+  v_id uuid; got text := null;
 begin
-  update public.send_attempts set state = 'smtp_accepted',     version = version + 1 where id = v_a1;
-  update public.send_attempts set state = 'sent_copy_pending', version = version + 1 where id = v_a1;
-  begin
-    update transport.send_mime_artifacts set raw_mime = null, cleared_at = now() where id = v_art;
-    got := 'no-error';
-  exception
-    when sqlstate '23514' then got := '23514';
-    when others then got := sqlstate;
-  end;
-  perform public.test_assert(got = '23514',
-    format('retention: clearing while the attempt is sent_copy_pending is rejected with 23514 (got %s)', got));
-end $$;
-
--- 3d. Clearing is refused while the attempt is needs_human_review (23514):
---     artifact2 on attempt2 (which is driven to needs_human_review).
-do $$
-declare
-  v_raw bytea := decode((select val from t_ctx where key = 'raw_hex'), 'hex');
-  v_a2 uuid := (select val from t_ctx where key = 'attempt2')::uuid;
-  v_i2 uuid := (select val from t_ctx where key = 'intent2')::uuid;
-  v_msg2 text := (select val from t_ctx where key = 'msgid2');
-  v_id uuid;
-  got text := null;
-begin
-  insert into transport.send_mime_artifacts
-    (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
-  values
-    (v_a2, v_i2, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg2,
-     encode(sha256(v_raw), 'hex'), octet_length(v_raw), v_raw)
-  returning id into v_id;
-  update public.send_attempts set state = 'queued',             version = version + 1 where id = v_a2;
-  update public.send_attempts set state = 'claimed',            version = version + 1 where id = v_a2;
-  update public.send_attempts set state = 'needs_human_review', version = version + 1 where id = v_a2;
+  perform pg_temp.drive_to(v_a, 'claimed');
+  v_id := (transport.create_or_verify_send_mime_artifact(
+    v_a, v_i, '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', v_msg, v_sha, v_len, v_raw)).id;
+  update public.send_attempts set state='needs_human_review', version=version+1 where id=v_a;
   begin
     update transport.send_mime_artifacts set raw_mime = null, cleared_at = now() where id = v_id;
     got := 'no-error';
-  exception
-    when sqlstate '23514' then got := '23514';
-    when others then got := sqlstate;
-  end;
-  perform public.test_assert(got = '23514',
-    format('retention: clearing while the attempt is needs_human_review is rejected with 23514 (got %s)', got));
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('retention: clearing while needs_human_review is rejected 23514 (got %s)', got));
 end $$;
 
--- 3e. Clearing after 'completed' succeeds and PRESERVES the proof metadata.
+-- 4d. Clearing SUCCEEDS after 'completed' and PRESERVES the durable proof
+--     metadata (sha256/size/message_id and the parent refs).
 do $$
 declare
-  v_a1 uuid := (select val from t_ctx where key = 'attempt1')::uuid;
-  v_art uuid := (select val from t_ctx where key = 'artifact1')::uuid;
-  v_sha text := (select val from t_ctx where key = 'raw_sha');
-  v_len bigint := (select val from t_ctx where key = 'raw_len')::bigint;
-  v_msg text := (select val from t_ctx where key = 'msgid1');
+  v_a uuid := (select val from t_ctx where key='attempt_a1')::uuid;
+  v_i uuid := (select val from t_ctx where key='intent_a1')::uuid;
+  v_art uuid := (select val from t_ctx where key='artifact_a1')::uuid;
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_msg text := (select val from t_ctx where key='msgid_a1');
   r transport.send_mime_artifacts;
 begin
-  update public.send_attempts set state = 'completed', version = version + 1 where id = v_a1;
+  -- a1 is currently sent_copy_pending; advance to completed.
+  update public.send_attempts set state='completed', version=version+1 where id=v_a;
   update transport.send_mime_artifacts set raw_mime = null, cleared_at = now() where id = v_art;
   select * into r from transport.send_mime_artifacts where id = v_art;
   perform public.test_assert(r.raw_mime is null and r.cleared_at is not null,
     'retention: clearing after completed succeeds (raw gone, cleared_at stamped)');
   perform public.test_assert(
-    r.mime_sha256 = v_sha and r.size_bytes = v_len and r.message_id = v_msg,
-    'retention: clearing preserves mime_sha256, size_bytes and message_id');
+    r.mime_sha256 = v_sha and r.size_bytes = v_len and r.message_id = v_msg
+      and r.send_attempt_id = v_a and r.send_intent_id = v_i,
+    'retention: clearing preserves mime_sha256/size_bytes/message_id and the parent refs');
 end $$;
 
--- 3f. A cleared artifact stays frozen: re-clearing / re-attaching bytes is 23514.
+-- 4e. A cleared artifact stays frozen: re-attaching bytes is 23514.
 do $$
 declare
-  v_art uuid := (select val from t_ctx where key = 'artifact1')::uuid;
-  v_raw bytea := decode((select val from t_ctx where key = 'raw_hex'), 'hex');
+  v_art uuid := (select val from t_ctx where key='artifact_a1')::uuid;
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
   got text := null;
 begin
   begin
     update transport.send_mime_artifacts set raw_mime = v_raw, cleared_at = null where id = v_art;
     got := 'no-error';
-  exception
-    when sqlstate '23514' then got := '23514';
-    when others then got := sqlstate;
-  end;
-  perform public.test_assert(got = '23514',
-    format('retention: re-attaching bytes to a cleared artifact is rejected with 23514 (got %s)', got));
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('retention: re-attaching bytes to a cleared artifact is rejected 23514 (got %s)', got));
 end $$;
 
--- 3g. The worker holds NO DELETE (42501), so evidence cannot be destroyed.
+-- 4f. Clearing SUCCEEDS in the other two terminal-for-delivery states:
+--     cancelled and failed_before_delivery (separate attempts).
 do $$
-declare v_art uuid := (select val from t_ctx where key = 'artifact1')::uuid;
+declare
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_ws uuid := '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  v_a uuid; v_i uuid; v_msg text; v_id uuid; r transport.send_mime_artifacts;
 begin
-  begin
-    delete from transport.send_mime_artifacts where id = v_art;
-    raise exception 'worker DELETEd send_mime_artifacts' using errcode = 'ASSRT';
-  exception when insufficient_privilege then
-    perform public.test_assert(true, 'retention: transport_worker cannot DELETE artifacts (42501)');
-  end;
+  -- cancelled
+  v_a := (select val from t_ctx where key='attempt_clrcanc')::uuid;
+  v_i := (select val from t_ctx where key='intent_clrcanc')::uuid;
+  v_msg := (select val from t_ctx where key='msgid_clrcanc');
+  perform pg_temp.drive_to(v_a, 'claimed');
+  v_id := (transport.create_or_verify_send_mime_artifact(v_a, v_i, v_ws, v_msg, v_sha, v_len, v_raw)).id;
+  update public.send_attempts set state='cancelled', version=version+1 where id=v_a;
+  update transport.send_mime_artifacts set raw_mime = null, cleared_at = now() where id = v_id;
+  select * into r from transport.send_mime_artifacts where id = v_id;
+  perform public.test_assert(r.raw_mime is null and r.cleared_at is not null and r.mime_sha256 = v_sha,
+    'retention: clearing after cancelled succeeds and preserves the sha256');
+
+  -- failed_before_delivery
+  v_a := (select val from t_ctx where key='attempt_clrfbd')::uuid;
+  v_i := (select val from t_ctx where key='intent_clrfbd')::uuid;
+  v_msg := (select val from t_ctx where key='msgid_clrfbd');
+  perform pg_temp.drive_to(v_a, 'claimed');
+  v_id := (transport.create_or_verify_send_mime_artifact(v_a, v_i, v_ws, v_msg, v_sha, v_len, v_raw)).id;
+  update public.send_attempts set state='failed_before_delivery', version=version+1 where id=v_a;
+  update transport.send_mime_artifacts set raw_mime = null, cleared_at = now() where id = v_id;
+  select * into r from transport.send_mime_artifacts where id = v_id;
+  perform public.test_assert(r.raw_mime is null and r.cleared_at is not null and r.size_bytes = v_len,
+    'retention: clearing after failed_before_delivery succeeds and preserves the size');
 end $$;
 
 reset role;
 
 -- =====================================================================
--- 4. CONTENT HYGIENE — the audit trail can never carry raw MIME
+-- 5. CONTENT HYGIENE — the audit trail can never carry raw MIME
 -- =====================================================================
 do $$
 declare n int;
 begin
-  -- Structural: transport_audit has no bytea column at all.
   select count(*) into n
   from pg_attribute
   where attrelid = 'public.transport_audit'::regclass
@@ -567,13 +822,30 @@ begin
     and atttypid = 'bytea'::regtype;
   perform public.test_assert(n = 0,
     'hygiene: public.transport_audit has no bytea column (raw MIME is structurally impossible)');
-  -- Behavioral: nothing this suite did leaked the raw marker into any audit row.
   select count(*) into n
   from public.transport_audit
   where detail::text like '%PHASE3B-RAW-MIME-MARKER%'
      or coalesce(message_id, '') like '%PHASE3B-RAW-MIME-MARKER%';
   perform public.test_assert(n = 0,
     'hygiene: no transport_audit row contains this suite''s raw MIME marker');
+end $$;
+
+-- =====================================================================
+-- 6. GRAPH DELETION — a full workspace cascade removes derived artifacts
+--    (parent attempt/intent/workspace FKs are ON DELETE CASCADE).
+-- =====================================================================
+do $$
+declare n_before int; n_after int;
+begin
+  select count(*) into n_before from transport.send_mime_artifacts
+    where workspace_id = '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  perform public.test_assert(n_before > 0,
+    format('graph deletion: artifacts exist before the workspace delete (%s)', n_before));
+  delete from public.workspaces where id = '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  select count(*) into n_after from transport.send_mime_artifacts
+    where workspace_id = '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  perform public.test_assert(n_after = 0,
+    'graph deletion: the full workspace cascade removed every derived artifact (count 0)');
 end $$;
 
 rollback;
