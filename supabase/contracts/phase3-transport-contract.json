@@ -21,12 +21,12 @@
     {
       "order": 4,
       "file": "20260716100000_confirmed_send_snapshots.sql",
-      "sha256": "83456d5e8396e610f4b0c100fe7615c4193ed60df60be818ba7211facae9cd0e"
+      "sha256": "1d79d3f542392d737eea550989e3b8b10ffa74a18315cf29ae207d8a45adce17"
     },
     {
       "order": 5,
       "file": "20260717100000_send_mime_artifacts.sql",
-      "sha256": "52937a0d35f1e3f4c9791ffb5092742ec33a6eefd06fa3c9dcb2492fe34ff490"
+      "sha256": "90ad8911bd89d7fdf3774e1a8387fccfeac7f52bd4bd45aba2b6ea978c161b78"
     }
   ],
   "workerRole": "transport_worker",
@@ -43,6 +43,11 @@
     },
     {
       "function": "transport.get_mirror_snapshot(uuid,uuid,bigint)",
+      "privilege": "EXECUTE",
+      "grantee": "transport_worker"
+    },
+    {
+      "function": "transport.create_or_verify_send_mime_artifact(uuid,uuid,uuid,text,text,bigint,bytea)",
       "privilege": "EXECUTE",
       "grantee": "transport_worker"
     }
@@ -92,6 +97,21 @@
       "function": "transport.get_mirror_snapshot(uuid,uuid,bigint)",
       "privilege": "EXECUTE",
       "grantee": "authenticated"
+    },
+    {
+      "function": "transport.create_or_verify_send_mime_artifact(uuid,uuid,uuid,text,text,bigint,bytea)",
+      "privilege": "EXECUTE",
+      "grantee": "public"
+    },
+    {
+      "function": "transport.create_or_verify_send_mime_artifact(uuid,uuid,uuid,text,text,bigint,bytea)",
+      "privilege": "EXECUTE",
+      "grantee": "anon"
+    },
+    {
+      "function": "transport.create_or_verify_send_mime_artifact(uuid,uuid,uuid,text,text,bigint,bytea)",
+      "privilege": "EXECUTE",
+      "grantee": "authenticated"
     }
   ],
   "protectedPrivateSchemas": ["transport"],
@@ -104,7 +124,7 @@
     {
       "table": "transport.send_mime_artifacts",
       "grantee": "transport_worker",
-      "privileges": ["SELECT", "INSERT", "UPDATE"]
+      "privileges": ["SELECT", "UPDATE"]
     }
   ],
   "forbiddenTablePrivileges": [
@@ -116,13 +136,13 @@
     {
       "table": "transport.send_mime_artifacts",
       "grantee": "transport_worker",
-      "privileges": ["DELETE"]
+      "privileges": ["INSERT", "DELETE"]
     }
   ],
   "rawMimeMaxBytes": 26214400,
   "invariants": {
-    "sendIntentExactSnapshot": "Every proof_version-2 send intent is bound, atomically at confirm time, to an immutable draft_versions snapshot (draft_version_id, ON DELETE RESTRICT) of the exact content the user approved; legacy proof_version-1 intents (NULL draft_version_id) are non-sendable fail-closed (transport.get_send_snapshot raises P0002). The worker reads confirmed content only through the private snapshot functions — draft_versions has no worker table grant.",
-    "mimeArtifactImmutability": "transport.send_mime_artifacts rows are insert-verified (sha256(raw_mime) = mime_sha256, exact size, attempt/intent/workspace/message_id chain match) and immutable except the single retention-clearing transition (raw_mime -> NULL + cleared_at stamped, all metadata byte-identical).",
+    "sendIntentExactSnapshot": "Every send intent is created at contract_version 2 / proof_version 2 (create_send_intent rejects any other value) with the locked draft subject/body/revision as sole authority, and is bound atomically at confirm time to an immutable draft_versions snapshot by a COMPOSITE identity foreign key (draft_version_id, workspace_id, draft_id, draft_revision) -> draft_versions (id, workspace_id, draft_id, source_revision), DEFERRABLE INITIALLY DEFERRED, ON DELETE NO ACTION — proving the snapshot's exact workspace/draft/revision, not mere existence, while still permitting full workspace/draft graph deletion. Legacy proof_version-1 intents (NULL draft_version_id) are non-sendable fail-closed (transport.get_send_snapshot raises a uniform P0002). The worker reads confirmed content only through the private snapshot functions — draft_versions has no worker table grant.",
+    "mimeArtifactImmutability": "transport.send_mime_artifacts rows are created ONLY via transport.create_or_verify_send_mime_artifact while the send attempt is in state 'claimed' (before smtp_in_progress); the worker has no direct INSERT. The function verifies sha256(raw_mime) = mime_sha256, exact size, the attempt/intent/workspace/message_id chain, and the 25 MiB bound; an existing artifact is returned only on exact identity (bytes/hash/size/message_id), never overwritten. Rows are immutable except the single retention-clearing transition (raw_mime -> NULL + cleared_at stamped, all metadata byte-identical).",
     "mimeArtifactRetention": "Raw MIME bytes may be cleared only after the attempt is completed/failed_before_delivery/cancelled; mime_sha256, size_bytes and message_id survive clearing as the durable proof; payloads are bounded by rawMimeMaxBytes (25 MiB) and never reachable by browser roles."
   },
   "queues": {
