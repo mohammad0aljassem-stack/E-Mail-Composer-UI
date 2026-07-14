@@ -86,23 +86,60 @@ alter table public.draft_versions
 alter table public.send_intents
   add column if not exists draft_version_id uuid;
 comment on column public.send_intents.draft_version_id is
-  'Phase 3B: the immutable public.draft_versions snapshot of the EXACT confirmed content, created (or reused) by create_send_intent atomically with the intent. ON DELETE RESTRICT — the referenced snapshot cannot be removed from under a confirmed intent. NULL marks a legacy (proof_version 1) intent, which is non-sendable fail-closed (transport.get_send_snapshot raises P0002).';
+  'Phase 3B: the immutable public.draft_versions snapshot of the EXACT confirmed content, created (or reused) by create_send_intent atomically with the intent. Bound by a COMPOSITE identity FK (draft_version_id, workspace_id, draft_id, draft_revision) -> draft_versions (id, workspace_id, draft_id, source_revision), DEFERRABLE INITIALLY DEFERRED, ON DELETE NO ACTION: the reference proves the snapshot''s EXACT workspace/draft/revision (not mere existence) and the snapshot cannot be removed from under a confirmed intent, while a full workspace/draft cascade still deletes the whole graph in one deferred transaction. NULL marks a legacy (proof_version 1) intent — MATCH SIMPLE leaves such rows unenforced — which is non-sendable fail-closed (transport.get_send_snapshot raises P0002).';
 
+-- Composite identity UNIQUE on draft_versions: (id, workspace_id, draft_id,
+-- source_revision). id is already the PK, so this is a superset unique whose
+-- ONLY purpose is to be the referenceable target of the composite identity FK
+-- below (a composite FK must reference a unique/PK column set). Guarded so a
+-- re-apply is a no-op.
 do $do$
 begin
   if not exists (
     select 1 from pg_constraint
-    where conname = 'send_intents_draft_version_fk'
-      and conrelid = 'public.send_intents'::regclass
+    where conname = 'draft_versions_identity_uq'
+      and conrelid = 'public.draft_versions'::regclass
   ) then
-    alter table public.send_intents
-      add constraint send_intents_draft_version_fk
-      foreign key (draft_version_id) references public.draft_versions (id) on delete restrict;
+    alter table public.draft_versions
+      add constraint draft_versions_identity_uq
+      unique (id, workspace_id, draft_id, source_revision);
   end if;
 end
 $do$;
 
-create index if not exists idx_send_intents_draft_version on public.send_intents (draft_version_id);
+-- COMPOSITE IDENTITY FK. Replaces the single-column existence-only reference:
+-- the intent's (draft_version_id, workspace_id, draft_id, draft_revision) must
+-- match the snapshot's (id, workspace_id, draft_id, source_revision) EXACTLY, so
+-- an intent can never point at a snapshot from a different workspace, draft or
+-- revision. DEFERRABLE INITIALLY DEFERRED + ON DELETE NO ACTION: a snapshot
+-- cannot be deleted from under a live intent, yet a full workspace/draft cascade
+-- (which removes both the intent and the snapshot) settles at commit without the
+-- FK blocking. MATCH SIMPLE (the default) leaves a NULL draft_version_id (legacy)
+-- row unenforced — legacy intents correctly skip the FK. The old single-column
+-- constraint (if a prior apply created it) is dropped first.
+alter table public.send_intents
+  drop constraint if exists send_intents_draft_version_fk;
+do $do$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'send_intents_draft_version_identity_fk'
+      and conrelid = 'public.send_intents'::regclass
+  ) then
+    alter table public.send_intents
+      add constraint send_intents_draft_version_identity_fk
+      foreign key (draft_version_id, workspace_id, draft_id, draft_revision)
+      references public.draft_versions (id, workspace_id, draft_id, source_revision)
+      on delete no action
+      deferrable initially deferred;
+  end if;
+end
+$do$;
+
+-- Covering index on the FK's referencing columns (supersedes the former
+-- single-column index): supports the composite FK's referential lookups.
+create index if not exists idx_send_intents_draft_version
+  on public.send_intents (draft_version_id, workspace_id, draft_id, draft_revision);
 
 alter table public.send_intents
   add column if not exists proof_version integer not null default 1;
@@ -476,24 +513,29 @@ declare
   v_intent public.send_intents;
   v_version public.draft_versions;
 begin
+  -- UNIFORM, NON-DISCLOSING failure: every rejection below raises the IDENTICAL
+  -- P0002 message so the caller can never tell which check failed (missing
+  -- intent, legacy shape, missing/inconsistent snapshot are indistinguishable).
+  -- The intent must be a fully-formed v2 confirmation: proof_version 2,
+  -- contract_version 2, a non-null snapshot binding — anything else (a legacy
+  -- 1/1/null row) is non-sendable, fail closed.
   select * into v_intent from public.send_intents i where i.id = p_send_intent_id;
-  if not found then
-    raise exception 'send intent not found' using errcode = 'P0002';
+  if not found
+     or v_intent.proof_version <> 2
+     or v_intent.contract_version <> 2
+     or v_intent.draft_version_id is null then
+    raise exception 'send snapshot not found or not accessible' using errcode = 'P0002';
   end if;
-  -- Legacy intents (proof_version 1) carry no snapshot binding: fail closed —
-  -- they are non-sendable under the v2 worker contract.
-  if v_intent.draft_version_id is null then
-    raise exception 'send intent has no confirmed snapshot (legacy intent; non-sendable)'
-      using errcode = 'P0002';
-  end if;
+  -- The referenced snapshot must exist and match the intent's EXACT identity —
+  -- workspace, draft AND revision (the composite identity FK guarantees this for
+  -- every row it enforces; this re-assertion is defence in depth and also covers
+  -- any row the FK did not enforce). Same uniform P0002 on any miss.
   select * into v_version from public.draft_versions dv where dv.id = v_intent.draft_version_id;
-  -- The referenced snapshot must exist and be consistent with the intent's own
-  -- workspace/draft; any inconsistency fails closed with the uniform P0002.
   if not found
      or v_version.workspace_id is distinct from v_intent.workspace_id
-     or v_version.draft_id is distinct from v_intent.draft_id then
-    raise exception 'confirmed snapshot not found or inconsistent with its intent'
-      using errcode = 'P0002';
+     or v_version.draft_id is distinct from v_intent.draft_id
+     or v_version.source_revision is distinct from v_intent.draft_revision then
+    raise exception 'send snapshot not found or not accessible' using errcode = 'P0002';
   end if;
   return query select
     v_version.id, v_version.workspace_id, v_version.draft_id,
@@ -502,7 +544,7 @@ begin
 end;
 $$;
 comment on function transport.get_send_snapshot(uuid) is
-  'Phase 3B (PRIVATE, SECURITY DEFINER): the worker''s ONLY read path for confirmed send content. Returns exactly the draft_versions snapshot referenced by the intent''s draft_version_id, after asserting the snapshot''s workspace/draft match the intent''s (P0002 on any miss or inconsistency). A legacy intent with NULL draft_version_id fails closed with P0002 — non-sendable. EXECUTE: transport_worker + service_role only; draft_versions itself has NO worker table grant.';
+  'Phase 3B (PRIVATE, SECURITY DEFINER): the worker''s ONLY read path for confirmed send content. Returns exactly the draft_versions snapshot referenced by the intent''s draft_version_id ONLY when the intent is a fully-formed v2 confirmation (proof_version 2, contract_version 2, non-null draft_version_id) AND the snapshot matches the intent''s EXACT identity (workspace_id, draft_id, source_revision = draft_revision). Every failure — missing intent, legacy 1/1/NULL shape, or a missing/inconsistent snapshot — raises the IDENTICAL, non-disclosing P0002 so the caller cannot tell which check failed. Legacy intents are non-sendable fail-closed. EXECUTE: transport_worker + service_role only; draft_versions itself has NO worker table grant.';
 
 -- 4.2 transport.get_mirror_snapshot — newest snapshot of one exact revision
 --     (workspace-scoped; used by the draft-mirror path, never for sending).
