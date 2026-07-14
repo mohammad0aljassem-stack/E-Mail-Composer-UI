@@ -22,16 +22,26 @@ close both gaps:
 ### Confirm-time snapshot atomicity, exact reference, proof v2
 
 `create_send_intent` (same signature; idempotency fingerprint unchanged —
-inputs only) now, in one transaction: locks the draft (`FOR UPDATE`), requires
-the **exact** current revision (`P0409` on mismatch, matching the `save_draft`
-convention), reuses-or-creates an immutable `public.draft_versions` snapshot
-(`reason = 'send_confirmation'`) of the confirmed subject/body, and binds the
-intent to it via `send_intents.draft_version_id` (`ON DELETE RESTRICT`) with
-`proof_version = 2`. The v2 confirmation-proof canonical additionally covers
-`proof_version` and the exact `draft_version_id`, so the user's approval is
-cryptographically bound to the exact snapshot that will be sent. A rejected
-confirm (stale revision, sender mismatch, cross-workspace draft) writes no
-intent, no attempt, no audit row **and no snapshot**.
+inputs only) rejects any call whose `contract_version` is not exactly `2`
+(`22023`) and stamps a **server-authoritative** `contract_version = 2` /
+`proof_version = 2` (never the caller's value). In one transaction it locks the
+draft (`FOR UPDATE`), requires the **exact** current revision (`P0409` on
+mismatch, matching the `save_draft` convention), reuses-or-creates an immutable
+`public.draft_versions` snapshot (`reason = 'send_confirmation'`) of the
+confirmed subject/body, and binds the intent to it via a **composite-identity**
+foreign key — `send_intents (draft_version_id, workspace_id, draft_id,
+draft_revision)` → `draft_versions (id, workspace_id, draft_id,
+source_revision)`, **`DEFERRABLE INITIALLY DEFERRED`, `ON DELETE NO ACTION`**
+(not a single-column `draft_version_id` reference, and not `ON DELETE
+RESTRICT`). The composite key makes the snapshot's own workspace/draft/revision
+provably identical to the intent's; `MATCH SIMPLE` leaves a legacy NULL
+`draft_version_id` un-enforced. The v2 confirmation-proof canonical additionally
+covers `proof_version` and the exact `draft_version_id`, so the user's approval
+is cryptographically bound to the exact snapshot that will be sent. A CHECK
+constraint keeps `(proof_version, contract_version, draft_version_id)` moving
+together (legacy `1/1/NULL` or current `2/2/NOT NULL`). A rejected confirm
+(stale revision, sender mismatch, cross-workspace draft) writes no intent, no
+attempt, no audit row **and no snapshot**.
 
 ### Private worker-only snapshot functions instead of a broad grant
 
@@ -61,12 +71,34 @@ fallback to re-reading the mutable draft.
 `transport.send_mime_artifacts` (private schema; RLS enabled with no policies,
 like `mailbox_credentials`) stores the exact raw MIME bytes per `send_attempt`:
 
-- **Insert verification** (BEFORE INSERT trigger, `23514` on violation):
-  `raw_mime` NOT NULL with `sha256(raw_mime) = mime_sha256` and byte length
-  `= size_bytes`; the attempt must belong to the claimed intent; the intent's
-  `workspace_id` and `message_id` must match the row. One artifact per attempt
-  (unique; a duplicate is `23505` — the worker repository's idempotent path is
-  its `ON CONFLICT` insert).
+- **Creation path**: the worker has **NO direct INSERT** on
+  `send_mime_artifacts`; it creates artifacts **exclusively** through
+  `transport.create_or_verify_send_mime_artifact` (SECURITY DEFINER; EXECUTE for
+  `transport_worker` + `service_role` only). That function locks the attempt row
+  `FOR UPDATE`, first-creates only while the attempt is exactly `claimed`, and on
+  a re-call **VERIFIES** identity. The verify path **always re-hashes the
+  caller's actual `p_raw_mime` against the stored durable `mime_sha256` /
+  `size_bytes` — cleared or not** (echoing the old declared hash/size is
+  insufficient; a cleared row keeps its digest/size, so a caller must still prove
+  it holds the exact bytes), never overwrites retained bytes, and raises a
+  uniform, content-free `23514` on any divergence.
+- **Insert verification** (BEFORE INSERT trigger, `23514` on violation, fires on
+  every insert path including a direct privileged INSERT): `raw_mime` NOT NULL
+  with `sha256(raw_mime) = mime_sha256` and byte length `= size_bytes`; the
+  attempt must belong to the intent; the intent's `workspace_id` and
+  `message_id` must match the row; and the attempt must be exactly `claimed`. One
+  artifact per attempt (unique; a duplicate is `23505`).
+- **Artifact-before-SMTP guard** (BEFORE UPDATE OF state on
+  `public.send_attempts`, `WHEN old.state='claimed' AND
+new.state='smtp_in_progress'`, `23514` on violation): the transition is refused
+  unless exactly one fully-valid **retained** artifact exists for the attempt
+  (same intent/workspace/message_id; bytes present, not cleared; within 25 MiB;
+  `octet_length(raw_mime)=size_bytes`; `sha256(raw_mime)=mime_sha256`, re-verified
+  at this one-time boundary). This closes the ordering gap where an attempt could
+  enter `smtp_in_progress` with no artifact — after which creation (`claimed`
+  only) is permanently impossible. The guard does not fire on the other
+  off-`claimed` transitions (`failed_before_delivery`/`cancelled`/
+  `needs_human_review`).
 - **Immutability**: the only legal UPDATE is the retention-clearing transition
   — `raw_mime` NOT NULL → NULL together with `cleared_at` NULL → NOT NULL, all
   other columns byte-identical — and only once the attempt is
@@ -75,8 +107,9 @@ like `mailbox_credentials`) stores the exact raw MIME bytes per `send_attempt`:
   so the proof outlives the bytes. Payloads are bounded at **25 MiB**
   (`rawMimeMaxBytes = 26214400`).
 - **Browser denial**: anon/authenticated have zero reach (no schema USAGE, no
-  table privilege). The worker gets exactly SELECT/INSERT/UPDATE — **never
-  DELETE**; only `service_role`'s operational ownership can remove rows.
+  table privilege). The worker gets exactly **SELECT + UPDATE** — **never INSERT,
+  never DELETE**; only `service_role`'s operational ownership (or a full
+  workspace/draft graph deletion via the parent CASCADE FKs) removes rows.
 
 ### Contract v2
 
@@ -99,6 +132,6 @@ The ADR 0003 immutable-checksum rule and cross-repo workflow apply unchanged.
 - Sent-copy append and delivery disputes are resolvable byte-for-byte from
   `transport.send_mime_artifacts` while retention holds, and by hash after
   clearing.
-- Proven by `supabase/tests/database/confirmed_send_snapshots.test.sql` (49
-  assertions) and `send_mime_artifacts.test.sql` (42 assertions) against the
+- Proven by `supabase/tests/database/confirmed_send_snapshots.test.sql` (87
+  assertions) and `send_mime_artifacts.test.sql` (83 assertions) against the
   real roles, with no test-only grants.
