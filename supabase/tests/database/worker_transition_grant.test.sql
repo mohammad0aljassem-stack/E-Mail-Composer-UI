@@ -79,8 +79,8 @@ begin
     d.id, d.revision,
     'ops@worker.example.com',
     '{"to":["dest@example.com"],"cc":[],"bcc":[]}'::jsonb,
-    'Hello worker', null, null, '[]'::jsonb,
-    null, null, 1, 'worker-idem-1');
+    'worker draft', null, null, '[]'::jsonb,
+    null, null, 2, 'worker-idem-1');
   select id into v_attempt from public.send_attempts where send_intent_id = i.id;
   insert into t_ctx values ('intent', i.id::text), ('attempt', v_attempt::text);
 end $$;

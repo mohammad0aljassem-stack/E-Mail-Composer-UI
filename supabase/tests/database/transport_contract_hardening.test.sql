@@ -108,8 +108,8 @@ begin
     v_draft, v_rev,
     '  OPS@W1.Example.com  ',                    -- padded + mixed case; matches after normalize
     '{"to":["dest@example.com"],"cc":[],"bcc":[]}'::jsonb,
-    'Hello', null, null, '[]'::jsonb,
-    null, null, 1, 'sa-pos-1');
+    'hardening', null, null, '[]'::jsonb,
+    null, null, 2, 'sa-pos-1');
   perform public.test_assert(i.id is not null, 'sender authority: normalized matching sender succeeds');
   perform public.test_assert(i.sender = 'ops@w1.example.com',
     'sender authority: the stored sender is the normalized authoritative address');
@@ -136,8 +136,8 @@ begin
       v_draft, v_rev,
       'evil@attacker.example',                    -- NOT the mailbox address
       '{"to":["dest@example.com"]}'::jsonb,
-      'Hello', null, null, '[]'::jsonb,
-      null, null, 1, 'sa-neg-1');
+      'hardening', null, null, '[]'::jsonb,
+      null, null, 2, 'sa-neg-1');
   exception when sqlstate '22023' then
     caught := true;
   end;
@@ -165,10 +165,10 @@ begin
     'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
     'cccccccc-cccc-cccc-cccc-ccccccccccc1',
     v_draft, v_rev, 'ops@w1.example.com',
-    '{"to":["a@b.com"],"cc":[],"bcc":[]}'::jsonb, 'Subject A',
+    '{"to":["a@b.com"],"cc":[],"bcc":[]}'::jsonb, 'hardening',
     repeat('a', 64), repeat('b', 64), '[{"name":"f"}]'::jsonb,
     '99999999-9999-9999-9999-999999999991', '99999999-9999-9999-9999-999999999992',
-    1, 'idem-strict');
+    2, 'idem-strict');
   insert into t_ctx values ('strict', i.id::text);
 end $$;
 
@@ -185,19 +185,27 @@ begin
     'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
     'cccccccc-cccc-cccc-cccc-ccccccccccc1',
     v_draft, v_rev, 'ops@w1.example.com',
-    '{"to":["a@b.com"],"cc":[],"bcc":[]}'::jsonb, 'Subject A',
+    '{"to":["a@b.com"],"cc":[],"bcc":[]}'::jsonb, 'hardening',
     repeat('a', 64), repeat('b', 64), '[{"name":"f"}]'::jsonb,
     '99999999-9999-9999-9999-999999999991', '99999999-9999-9999-9999-999999999992',
-    1, 'idem-strict');
+    2, 'idem-strict');
   perform public.test_assert(i.id = v_strict, 'strict idempotency: identical replay returns the same intent');
   select count(*) into n from public.send_intents where idempotency_key = 'idem-strict';
   perform public.test_assert(n = 1, 'strict idempotency: identical replay creates no duplicate');
 end $$;
 
 -- 2c. Same key + EACH kind of changed field => P0409. A generic helper runs one
---     divergent call and asserts P0409 (and asserts it is NOT 22023/P0002 — no
---     other outcome leaks through). Each row below flips exactly one field away
---     from the baseline in 2a.
+--     divergent call and asserts the expected code. Each row below flips exactly
+--     one field away from the baseline in 2a (subject 'hardening', contract 2);
+--     every non-target field MATCHES the baseline so exactly one axis diverges
+--     and the divergence is proven to be what raises the conflict.
+--
+--     Under the Slice-1 contract, contract_version is server-pinned to exactly 2
+--     (any other value is a fail-closed 22023 at the gate, BEFORE the idempotency
+--     lookup). A "changed contract_version" fingerprint divergence is therefore
+--     no longer expressible; the corresponding case now proves the meaningful
+--     replacement — a non-2 contract_version is REJECTED at the gate (22023),
+--     never reaching the idempotency path. Each row declares its expected code.
 do $$
 declare
   r record;
@@ -207,49 +215,49 @@ declare
 begin
   for r in
     select label,
-           p_ws, p_mb, p_dr, p_sender, p_rcpt, p_subj, p_html, p_text, p_manifest, p_tmpl, p_sig, p_contract
+           p_ws, p_mb, p_dr, p_sender, p_rcpt, p_subj, p_html, p_text, p_manifest, p_tmpl, p_sig, p_contract, expected
     from (values
       ('changed subject',
         'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa','cccccccc-cccc-cccc-cccc-ccccccccccc1', v_rev,
-        'ops@w1.example.com', '{"to":["a@b.com"],"cc":[],"bcc":[]}', 'Subject B',
+        'ops@w1.example.com', '{"to":["a@b.com"],"cc":[],"bcc":[]}', 'hardening CHANGED',
         repeat('a',64), repeat('b',64), '[{"name":"f"}]',
-        '99999999-9999-9999-9999-999999999991','99999999-9999-9999-9999-999999999992', 1),
+        '99999999-9999-9999-9999-999999999991','99999999-9999-9999-9999-999999999992', 2, 'P0409'),
       ('changed recipients',
         'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa','cccccccc-cccc-cccc-cccc-ccccccccccc1', v_rev,
-        'ops@w1.example.com', '{"to":["z@b.com"],"cc":[],"bcc":[]}', 'Subject A',
+        'ops@w1.example.com', '{"to":["z@b.com"],"cc":[],"bcc":[]}', 'hardening',
         repeat('a',64), repeat('b',64), '[{"name":"f"}]',
-        '99999999-9999-9999-9999-999999999991','99999999-9999-9999-9999-999999999992', 1),
+        '99999999-9999-9999-9999-999999999991','99999999-9999-9999-9999-999999999992', 2, 'P0409'),
       ('changed draft_revision',
         'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa','cccccccc-cccc-cccc-cccc-ccccccccccc1', v_rev + 1,
-        'ops@w1.example.com', '{"to":["a@b.com"],"cc":[],"bcc":[]}', 'Subject A',
+        'ops@w1.example.com', '{"to":["a@b.com"],"cc":[],"bcc":[]}', 'hardening',
         repeat('a',64), repeat('b',64), '[{"name":"f"}]',
-        '99999999-9999-9999-9999-999999999991','99999999-9999-9999-9999-999999999992', 1),
+        '99999999-9999-9999-9999-999999999991','99999999-9999-9999-9999-999999999992', 2, 'P0409'),
       ('changed html_hash',
         'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa','cccccccc-cccc-cccc-cccc-ccccccccccc1', v_rev,
-        'ops@w1.example.com', '{"to":["a@b.com"],"cc":[],"bcc":[]}', 'Subject A',
+        'ops@w1.example.com', '{"to":["a@b.com"],"cc":[],"bcc":[]}', 'hardening',
         repeat('c',64), repeat('b',64), '[{"name":"f"}]',
-        '99999999-9999-9999-9999-999999999991','99999999-9999-9999-9999-999999999992', 1),
+        '99999999-9999-9999-9999-999999999991','99999999-9999-9999-9999-999999999992', 2, 'P0409'),
       ('changed attachment_manifest',
         'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa','cccccccc-cccc-cccc-cccc-ccccccccccc1', v_rev,
-        'ops@w1.example.com', '{"to":["a@b.com"],"cc":[],"bcc":[]}', 'Subject A',
+        'ops@w1.example.com', '{"to":["a@b.com"],"cc":[],"bcc":[]}', 'hardening',
         repeat('a',64), repeat('b',64), '[]',
-        '99999999-9999-9999-9999-999999999991','99999999-9999-9999-9999-999999999992', 1),
+        '99999999-9999-9999-9999-999999999991','99999999-9999-9999-9999-999999999992', 2, 'P0409'),
       ('changed template_version_id',
         'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa','cccccccc-cccc-cccc-cccc-ccccccccccc1', v_rev,
-        'ops@w1.example.com', '{"to":["a@b.com"],"cc":[],"bcc":[]}', 'Subject A',
+        'ops@w1.example.com', '{"to":["a@b.com"],"cc":[],"bcc":[]}', 'hardening',
         repeat('a',64), repeat('b',64), '[{"name":"f"}]',
-        '99999999-9999-9999-9999-99999999999a','99999999-9999-9999-9999-999999999992', 1),
+        '99999999-9999-9999-9999-99999999999a','99999999-9999-9999-9999-999999999992', 2, 'P0409'),
       ('changed signature_id',
         'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa','cccccccc-cccc-cccc-cccc-ccccccccccc1', v_rev,
-        'ops@w1.example.com', '{"to":["a@b.com"],"cc":[],"bcc":[]}', 'Subject A',
+        'ops@w1.example.com', '{"to":["a@b.com"],"cc":[],"bcc":[]}', 'hardening',
         repeat('a',64), repeat('b',64), '[{"name":"f"}]',
-        '99999999-9999-9999-9999-999999999991','99999999-9999-9999-9999-99999999999b', 1),
-      ('changed contract_version',
+        '99999999-9999-9999-9999-999999999991','99999999-9999-9999-9999-99999999999b', 2, 'P0409'),
+      ('non-2 contract_version rejected at the gate',
         'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa','cccccccc-cccc-cccc-cccc-ccccccccccc1', v_rev,
-        'ops@w1.example.com', '{"to":["a@b.com"],"cc":[],"bcc":[]}', 'Subject A',
+        'ops@w1.example.com', '{"to":["a@b.com"],"cc":[],"bcc":[]}', 'hardening',
         repeat('a',64), repeat('b',64), '[{"name":"f"}]',
-        '99999999-9999-9999-9999-999999999991','99999999-9999-9999-9999-999999999992', 2)
-    ) t(label, p_ws, p_mb, p_dr, p_sender, p_rcpt, p_subj, p_html, p_text, p_manifest, p_tmpl, p_sig, p_contract)
+        '99999999-9999-9999-9999-999999999991','99999999-9999-9999-9999-999999999992', 1, '22023')
+    ) t(label, p_ws, p_mb, p_dr, p_sender, p_rcpt, p_subj, p_html, p_text, p_manifest, p_tmpl, p_sig, p_contract, expected)
   loop
     got := null;
     begin
@@ -261,10 +269,11 @@ begin
       got := 'no-error';
     exception
       when sqlstate 'P0409' then got := 'P0409';
+      when sqlstate '22023' then got := '22023';
       when others then got := sqlstate;
     end;
-    perform public.test_assert(got = 'P0409',
-      format('strict idempotency: %s under the same key raises P0409 (got %s)', r.label, got));
+    perform public.test_assert(got = r.expected,
+      format('strict idempotency: %s under the same key raises %s (got %s)', r.label, r.expected, got));
   end loop;
 end $$;
 
@@ -282,10 +291,10 @@ begin
       'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
       'cccccccc-cccc-cccc-cccc-ccccccccccc1',
       v_draft, v_rev, 'other@w1.example.com',
-      '{"to":["a@b.com"],"cc":[],"bcc":[]}'::jsonb, 'Subject A',
+      '{"to":["a@b.com"],"cc":[],"bcc":[]}'::jsonb, 'hardening',
       repeat('a', 64), repeat('b', 64), '[{"name":"f"}]'::jsonb,
       '99999999-9999-9999-9999-999999999991', '99999999-9999-9999-9999-999999999992',
-      1, 'idem-strict');
+      2, 'idem-strict');
     got := 'no-error';
   exception
     when sqlstate 'P0409' then got := 'P0409';
@@ -313,8 +322,8 @@ begin
       'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',     -- claims W1 (C is not a member)
       'cccccccc-cccc-cccc-cccc-ccccccccccc1',
       v_draft, 1, 'ops@w1.example.com',
-      '{"to":["different@b.com"]}'::jsonb, 'Totally Different', null, null, '[]'::jsonb,
-      null, null, 1, 'idem-strict');
+      '{"to":["different@b.com"]}'::jsonb, 'hardening', null, null, '[]'::jsonb,
+      null, null, 2, 'idem-strict');
     got := 'no-error';
   exception
     when sqlstate 'P0002' then got := 'P0002';
