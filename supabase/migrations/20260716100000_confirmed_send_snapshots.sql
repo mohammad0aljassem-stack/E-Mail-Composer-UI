@@ -15,14 +15,15 @@
 --     -> THIS
 --
 -- It is strictly ADDITIVE: it widens one CHECK constraint on
--- public.draft_versions (adds ONE new allowed reason), adds two nullable/
--- defaulted columns to public.send_intents, CREATE-OR-REPLACEs the
--- create_send_intent RPC, and adds two PRIVATE worker-only snapshot functions
--- in the transport schema. It never drops or rewrites any prior object and
--- never destroys data. Idempotency: every statement is guarded (add column if
--- not exists / create index if not exists / create or replace / guarded DO
--- blocks / drop-constraint-if-exists-then-re-add with the identical widened
--- definition / revoke-then-grant), so a re-run is a no-op-equivalent.
+-- public.draft_versions (adds ONE new allowed reason), adds a composite identity
+-- UNIQUE to public.draft_versions, adds two nullable/defaulted columns plus a
+-- named row-shape CHECK and a composite identity FK to public.send_intents,
+-- CREATE-OR-REPLACEs the create_send_intent RPC, and adds two PRIVATE worker-only
+-- snapshot functions in the transport schema. It never drops or rewrites any
+-- prior object and never destroys data. Idempotency: every statement is guarded
+-- (add column if not exists / create index if not exists / create or replace /
+-- guarded DO blocks / drop-constraint-if-exists-then-re-add with the identical
+-- widened definition / revoke-then-grant), so a re-run is a no-op-equivalent.
 --
 -- THE CORRECTED DEFECT — confirm-time content binding:
 --   A send_intent recorded only draft_id + draft_revision plus client-supplied
@@ -33,11 +34,18 @@
 --     1. lock the draft row (FOR UPDATE),
 --     2. require the EXACT current revision (P0409 on mismatch — the canonical
 --        conflict code, matching the save_draft convention),
+--     2b. require the confirmed subject to EXACTLY equal the locked draft
+--        subject (P0409 on any byte difference) and pin the authoritative
+--        subject to the locked value,
 --     3. reuse-or-create an immutable public.draft_versions snapshot of the
 --        confirmed content (reason = 'send_confirmation'),
---     4. bind the intent to that snapshot (send_intents.draft_version_id,
---        ON DELETE RESTRICT) and stamp proof_version = 2 (the confirmation
---        proof canonical now covers the exact snapshot reference).
+--     4. bind the intent to that snapshot by a COMPOSITE identity FK
+--        (draft_version_id, workspace_id, draft_id, draft_revision) ->
+--        (id, workspace_id, draft_id, source_revision), DEFERRABLE INITIALLY
+--        DEFERRED, ON DELETE NO ACTION, and stamp contract_version 2 +
+--        proof_version 2 (server-owned; the confirmation proof canonical covers
+--        the exact snapshot reference). A named row-shape CHECK keeps
+--        proof_version/contract_version/draft_version_id moving together.
 --   The worker reads the confirmed content ONLY through the two PRIVATE
 --   SECURITY DEFINER functions below — draft_versions itself gets NO table
 --   grant to transport_worker. Legacy intents (proof_version 1, NULL
@@ -115,6 +123,31 @@ begin
 end
 $do$;
 
+-- Row-shape integrity: a send_intent may ONLY be one of exactly two shapes —
+--   legacy  = (proof_version 1, contract_version 1, draft_version_id NULL), or
+--   current = (proof_version 2, contract_version 2, draft_version_id NOT NULL).
+-- Every hybrid (2/1, 1/2, proof 2 with a NULL snapshot, proof 1 with a snapshot)
+-- is rejected. This makes proof_version, contract_version and the snapshot
+-- binding move together, so no direct-owner insert can forge a half-upgraded
+-- intent. Subsumes the proof_version_allowed check above (both are kept:
+-- belt-and-suspenders + a clearer per-column error on a bad proof_version).
+do $do$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'send_intents_proof_contract_shape'
+      and conrelid = 'public.send_intents'::regclass
+  ) then
+    alter table public.send_intents
+      add constraint send_intents_proof_contract_shape
+      check (
+        (proof_version = 1 and contract_version = 1 and draft_version_id is null)
+        or (proof_version = 2 and contract_version = 2 and draft_version_id is not null)
+      );
+  end if;
+end
+$do$;
+
 -- ===========================================================================
 -- 3. create_send_intent — confirm-time snapshot binding (CREATE OR REPLACE)
 --
@@ -141,7 +174,7 @@ create or replace function public.create_send_intent(
   p_attachment_manifest jsonb,
   p_template_version_id uuid default null,
   p_signature_id uuid default null,
-  p_contract_version integer default 1,
+  p_contract_version integer default 2,
   p_idempotency_key text default null
 ) returns public.send_intents
 language plpgsql
@@ -160,7 +193,11 @@ declare
   v_subject text := coalesce(p_subject, '');
   v_recipients jsonb := coalesce(p_recipients, '{}'::jsonb);
   v_manifest jsonb := coalesce(p_attachment_manifest, '[]'::jsonb);
-  v_contract integer := coalesce(p_contract_version, 1);
+  -- Server-owned AUTHORITATIVE contract version. The caller's p_contract_version
+  -- is validated (must be exactly 2) but NEVER stored — the fingerprint, the
+  -- confirmation proof and the persisted send_intents.contract_version all use
+  -- this constant, so a caller can never write any other value.
+  v_contract_version constant integer := 2;
   v_sender text;            -- normalized (authoritative) sender: trim + lowercase
   v_mailbox_addr text;      -- normalized mailbox.email_address
   v_fingerprint text;       -- deterministic request fingerprint (strict idempotency)
@@ -202,8 +239,12 @@ begin
   if p_text_hash is not null and p_text_hash !~ '^[a-f0-9]{64}$' then
     raise exception 'text_hash must be 64 lowercase hex characters' using errcode = '22023';
   end if;
-  if v_contract <= 0 then
-    raise exception 'contract_version must be positive' using errcode = '22023';
+  -- Fail-closed contract-version gate: ONLY exactly-2 is accepted. Rejected
+  -- BEFORE the idempotency lookup and any snapshot/intent/attempt/audit write,
+  -- so a rejected value leaves no trace. The stored value is the server-owned
+  -- authoritative constant (v_contract_version), never the caller's parameter.
+  if p_contract_version is null or p_contract_version <> 2 then
+    raise exception 'contract_version must be exactly 2' using errcode = '22023';
   end if;
 
   -- Strict-idempotency fingerprint: a deterministic sha256 over the CANONICAL
@@ -227,7 +268,7 @@ begin
     'attachment_manifest', v_manifest,
     'template_version_id', p_template_version_id,
     'signature_id', p_signature_id,
-    'contract_version', v_contract
+    'contract_version', v_contract_version
   );
   v_fingerprint := encode(sha256(convert_to(v_fp_canonical::text, 'UTF8')), 'hex');
 
@@ -303,6 +344,21 @@ begin
       using errcode = 'P0409', hint = 'current_revision=' || v_draft.revision;
   end if;
 
+  -- LOCKED-SUBJECT AUTHORITY: the subject that is snapshotted, fingerprinted,
+  -- proven and stored is ALWAYS the locked draft's subject — never a divergent
+  -- p_subject. Require EXACT equality (no normalization: no case fold, trim,
+  -- unicode or whitespace collapse). A caller that confirms with a subject that
+  -- differs in any byte from the locked draft is a compare-and-set conflict
+  -- (P0409, the save_draft convention), raised BEFORE any snapshot/intent/
+  -- attempt/audit write so it leaves no trace. After the check we pin v_subject
+  -- to the authoritative locked value so every downstream use (snapshot compare,
+  -- proof canonical, the stored subject) is authoritative and can never diverge.
+  if coalesce(p_subject, '') <> v_draft.subject then
+    raise exception 'subject does not match the confirmed draft (expected the locked draft subject)'
+      using errcode = 'P0409';
+  end if;
+  v_subject := v_draft.subject;
+
   -- Snapshot reuse-or-create: if the newest version row for this draft already
   -- captures exactly this (source_revision, subject, body_json), reuse it;
   -- otherwise append an immutable 'send_confirmation' snapshot. Same
@@ -353,7 +409,7 @@ begin
     'template_version_id', p_template_version_id,
     'signature_id', p_signature_id,
     'message_id', v_message_id,
-    'contract_version', v_contract,
+    'contract_version', v_contract_version,
     'confirmed_by', v_uid,
     'proof_version', 2,
     'draft_version_id', v_draft_version_id
@@ -369,7 +425,7 @@ begin
   ) values (
     p_workspace_id, p_mailbox_id, p_draft_id, p_draft_revision, v_sender, v_recipients,
     v_subject, p_html_hash, p_text_hash, v_manifest, v_message_id,
-    v_idem, p_template_version_id, p_signature_id, v_contract,
+    v_idem, p_template_version_id, p_signature_id, v_contract_version,
     v_uid, v_proof, v_fingerprint,
     v_draft_version_id, 2
   ) returning * into v_intent;
@@ -388,7 +444,7 @@ begin
 end;
 $$;
 comment on function public.create_send_intent(uuid, uuid, uuid, bigint, text, jsonb, text, text, text, jsonb, uuid, uuid, integer, text) is
-  'Phase 3A/3B RPC (SECURITY DEFINER): the ONLY write path for send_intents. Verifies membership + mailbox/draft ownership + kill switch/enabled. SENDER AUTHORITY: rejects (22023) any p_sender that does not exactly match the mailbox address after trim+lowercase; derives the Message-ID domain from the MAILBOX address; stores the normalized authoritative sender. STRICT IDEMPOTENCY: stores a deterministic input-only request fingerprint and, on an idempotency-key hit, returns the existing intent only if the fingerprint matches, else raises P0409; non-members get a uniform P0002 (no existence leak). CONFIRM-TIME SNAPSHOT (Phase 3B): locks the draft (FOR UPDATE), requires the EXACT current revision (P0409 on mismatch, save_draft convention), reuses-or-creates an immutable draft_versions snapshot (reason=send_confirmation) of the confirmed content, and binds the intent to it (draft_version_id, proof_version=2) — snapshot, intent, seeded confirmed attempt and content-free audit event are all one atomic transaction.';
+  'Phase 3A/3B RPC (SECURITY DEFINER): the ONLY write path for send_intents. Verifies membership + mailbox/draft ownership + kill switch/enabled. CONTRACT VERSION: p_contract_version defaults to 2 and MUST be exactly 2 (else 22023, fail-closed before any write); the stored/fingerprinted/proven value is the server-owned constant 2, never the caller''s parameter. SENDER AUTHORITY: rejects (22023) any p_sender that does not exactly match the mailbox address after trim+lowercase; derives the Message-ID domain from the MAILBOX address; stores the normalized authoritative sender. STRICT IDEMPOTENCY: stores a deterministic input-only request fingerprint and, on an idempotency-key hit, returns the existing intent only if the fingerprint matches, else raises P0409; non-members get a uniform P0002 (no existence leak). CONFIRM-TIME SNAPSHOT (Phase 3B): locks the draft (FOR UPDATE), requires the EXACT current revision (P0409 on mismatch, save_draft convention), requires the confirmed subject to EXACTLY equal the locked draft subject (P0409 on any byte difference) and uses ONLY that locked subject for the snapshot/fingerprint/proof/stored subject, reuses-or-creates an immutable draft_versions snapshot (reason=send_confirmation) of the confirmed content, and binds the intent to it by a composite identity FK (proof_version=2, contract_version=2) — snapshot, intent, seeded confirmed attempt and content-free audit event are all one atomic transaction.';
 
 -- ===========================================================================
 -- 4. PRIVATE worker-only snapshot accessors (transport schema)
