@@ -313,6 +313,82 @@ grant execute on function transport.create_or_verify_send_mime_artifact(uuid, uu
   to transport_worker, service_role;
 
 -- ---------------------------------------------------------------------------
+-- 3c. ARTIFACT-BEFORE-SMTP ordering guard (defect: the transition table permits
+--     claimed -> smtp_in_progress, and nothing verified a MIME artifact exists,
+--     so an attempt could enter smtp_in_progress with NO artifact — after which
+--     artifact creation is PERMANENTLY impossible because the create/insert path
+--     requires state='claimed'). This trigger refuses that one transition unless a
+--     FULLY VALID, RETAINED artifact already exists, re-verifying the retained
+--     bytes' hash/size at this one-time boundary (existence alone is not enough).
+--
+--     SECURITY INVOKER: the worker is the only role with UPDATE on
+--     public.send_attempts and already holds SELECT on
+--     transport.send_mime_artifacts, so the guard runs with exactly the
+--     privileges the worker already has. Empty search_path; every object is fully
+--     schema-qualified. It only READS the artifact table and NEW/OLD, so its
+--     ordering relative to the existing BEFORE UPDATE guard
+--     (trg_send_attempts_before_update) is immaterial.
+-- ---------------------------------------------------------------------------
+create or replace function transport.require_mime_artifact_before_smtp()
+returns trigger
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_valid_count integer;
+begin
+  -- Gated by the trigger's WHEN clause to fire ONLY on claimed ->
+  -- smtp_in_progress. Require EXACTLY ONE fully-valid retained artifact for this
+  -- attempt: bound to the same intent/workspace/message_id, bytes present and
+  -- not cleared, within the 25 MiB bound, and — re-verified here at the one-time
+  -- boundary rather than trusting mere row existence — whose retained bytes still
+  -- hash and size to the stored durable digest/size.
+  select count(*)
+    into v_valid_count
+  from transport.send_mime_artifacts m
+  where m.send_attempt_id = new.id
+    and m.send_intent_id = new.send_intent_id
+    and m.workspace_id = new.workspace_id
+    and m.message_id is not null
+    and m.message_id = new.message_id
+    and m.raw_mime is not null
+    and m.cleared_at is null
+    and m.size_bytes > 0
+    and m.size_bytes <= 26214400
+    and octet_length(m.raw_mime) = m.size_bytes
+    and encode(sha256(m.raw_mime), 'hex') = m.mime_sha256;
+
+  if v_valid_count <> 1 then
+    -- Content-free, bounded message; the attempt stays in 'claimed'.
+    raise exception 'send attempt cannot enter smtp_in_progress without a persisted MIME artifact'
+      using errcode = '23514';
+  end if;
+  return new;
+end;
+$$;
+comment on function transport.require_mime_artifact_before_smtp() is
+  'Phase 3B ordering guard: BEFORE UPDATE OF state on public.send_attempts, gated (WHEN) to the exact claimed -> smtp_in_progress transition. Refuses that transition (23514, content-free) unless EXACTLY ONE fully-valid RETAINED transport.send_mime_artifacts row exists for the attempt (same intent/workspace/message_id; raw_mime present, not cleared; 0 < size_bytes <= 26214400; octet_length(raw_mime) = size_bytes; sha256(raw_mime) = mime_sha256 — re-verified at this one-time boundary, not merely row existence). Closes the gap where an attempt could reach smtp_in_progress with no artifact, after which creation (state=claimed only) is impossible. SECURITY INVOKER; only READS, so ordering vs trg_send_attempts_before_update is immaterial.';
+
+-- Internal machinery: nobody calls it directly. Grant EXECUTE to the roles that
+-- perform the UPDATE it fires on (matching the repo''s function-grant convention);
+-- the trigger executes as part of that worker/service_role UPDATE.
+revoke all on function transport.require_mime_artifact_before_smtp()
+  from public, anon, authenticated;
+grant execute on function transport.require_mime_artifact_before_smtp()
+  to transport_worker, service_role;
+
+-- Guarded (drop-if-exists then create) so the migration is idempotent under the
+-- suite's double-apply. BEFORE UPDATE OF state, fired only on the exact
+-- claimed -> smtp_in_progress transition by the WHEN clause.
+drop trigger if exists trg_send_attempts_require_mime_before_smtp on public.send_attempts;
+create trigger trg_send_attempts_require_mime_before_smtp
+  before update of state on public.send_attempts
+  for each row
+  when (old.state = 'claimed' and new.state = 'smtp_in_progress')
+  execute function transport.require_mime_artifact_before_smtp();
+
+-- ---------------------------------------------------------------------------
 -- 4. Grants (revoke-then-grant; idempotent). anon/authenticated get NOTHING.
 --    The worker gets exactly SELECT + UPDATE (UPDATE is the trigger-enforced
 --    clearing transition only) — NEVER INSERT (creation is exclusively through

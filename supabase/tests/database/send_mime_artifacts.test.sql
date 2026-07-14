@@ -33,6 +33,11 @@
 --      (the parent attempt/intent/workspace FKs are ON DELETE CASCADE).
 --   5. CONTENT HYGIENE — public.transport_audit has no bytea column and this
 --      suite's raw MIME marker never appears in any audit row.
+--   7. ARTIFACT-BEFORE-SMTP GUARD — a claimed attempt cannot enter
+--      smtp_in_progress (23514, stays claimed) until a fully-valid RETAINED
+--      artifact exists; once it does the transition succeeds. The guard does NOT
+--      fire on claimed -> failed_before_delivery / cancelled / needs_human_review
+--      (all work with no artifact). A hash-mismatched artifact can never exist.
 --
 -- Runs inside a single rolled-back transaction; leaves no rows behind.
 -- Distinct UUIDs (7777-based) avoid colliding with the other suites' seeds.
@@ -102,7 +107,12 @@ begin
     ('nhr2',    'mime nhr2'),      -- first-create fails in needs_human_review
     ('canc',    'mime canc'),      -- first-create fails in cancelled
     ('dgate',   'mime dgate'),     -- direct privileged INSERT: state-gate + chain
-    ('dok',     'mime dok')        -- direct privileged INSERT: valid + duplicate
+    ('dok',     'mime dok'),       -- direct privileged INSERT: valid + duplicate
+    ('gnoart',  'mime gnoart'),    -- C1: claimed->smtp_in_progress blocked w/o artifact, then allowed
+    ('gfbd',    'mime gfbd'),      -- C1: claimed->failed_before_delivery works w/o artifact
+    ('gcanc',   'mime gcanc'),     -- C1: claimed->cancelled works w/o artifact
+    ('gnhr',    'mime gnhr'),      -- C1: claimed->needs_human_review works w/o artifact
+    ('gmis',    'mime gmis')       -- C1: a hash-mismatched artifact can never exist
   ) v(k, subj)
   loop
     d := public.create_draft('7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', rec.subj,
@@ -312,10 +322,15 @@ begin
     'create/verify: two identical sequential calls return the same id (concurrent-safe)');
 end $$;
 
--- 1e. First-create FAILS (23514) in every non-'claimed' state. The 'states'
---     attempt walks confirmed->queued->[claimed, skipped]->smtp_in_progress->
---     smtp_accepted->sent_copy_pending->completed WITHOUT ever creating, so the
---     function keeps hitting the first-create state gate.
+-- 1e. First-create FAILS (23514) in the pre-'claimed' forward states. NOTE: since
+--     the artifact-before-smtp guard (Correction 1) now forbids
+--     claimed->smtp_in_progress without a retained artifact, an attempt can no
+--     longer legally REACH smtp_in_progress/smtp_accepted/sent_copy_pending/
+--     completed with NO artifact — so first-create in those states is unreachable
+--     by construction (see the guard tests below). Here the 'states' attempt walks
+--     confirmed->queued WITHOUT ever creating, so the function keeps hitting the
+--     first-create state gate; the terminal off-'claimed' branches
+--     (needs_human_review / cancelled) are covered in 1f.
 do $$
 declare
   v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
@@ -328,9 +343,9 @@ declare
   got text;
   st text;
 begin
-  foreach st in array array['confirmed','queued','smtp_in_progress','smtp_accepted','sent_copy_pending','completed']
+  foreach st in array array['confirmed','queued']
   loop
-    -- advance forward to st (walks THROUGH claimed without ever creating)
+    -- advance forward to st (both are before 'claimed'; no artifact created)
     perform pg_temp.drive_to(v_a, st);
     got := null;
     begin
@@ -808,6 +823,106 @@ begin
 end $$;
 
 reset role;
+
+-- =====================================================================
+-- 7. ARTIFACT-BEFORE-SMTP ORDERING GUARD (Correction 1). A claimed attempt may
+--    enter smtp_in_progress ONLY once a fully-valid RETAINED MIME artifact
+--    exists (closing the gap where an artifact-less attempt could enter
+--    smtp_in_progress, after which creation — state='claimed' only — is
+--    permanently impossible); the guard must NOT block the other off-claimed
+--    transitions.
+-- =====================================================================
+set local role transport_worker;
+
+-- 7a. No artifact: claimed->smtp_in_progress is refused 23514 and the attempt
+--     STAYS 'claimed'. After a valid retained artifact is created the SAME
+--     transition succeeds — so the guard's success provably required the
+--     hash/size-consistent artifact (its byte re-check).
+do $$
+declare
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_sha text := (select val from t_ctx where key='raw_sha');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_a uuid := (select val from t_ctx where key='attempt_gnoart')::uuid;
+  v_i uuid := (select val from t_ctx where key='intent_gnoart')::uuid;
+  v_msg text := (select val from t_ctx where key='msgid_gnoart');
+  v_ws uuid := '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  got text; st text;
+begin
+  perform pg_temp.drive_to(v_a, 'claimed');
+  -- (a) no artifact -> refused; attempt stays claimed
+  got := null;
+  begin
+    update public.send_attempts set state='smtp_in_progress', version=version+1 where id=v_a;
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('guard: claimed->smtp_in_progress with NO artifact is rejected 23514 (got %s)', got));
+  select state into st from public.send_attempts where id=v_a;
+  perform public.test_assert(st='claimed',
+    'guard: the refused attempt stays in claimed (bytes can still be attached)');
+
+  -- (b) create a valid retained artifact, then the SAME transition succeeds
+  perform transport.create_or_verify_send_mime_artifact(v_a, v_i, v_ws, v_msg, v_sha, v_len, v_raw);
+  update public.send_attempts set state='smtp_in_progress', version=version+1 where id=v_a;
+  select state into st from public.send_attempts where id=v_a;
+  perform public.test_assert(st='smtp_in_progress',
+    'guard: with a valid retained artifact claimed->smtp_in_progress succeeds');
+end $$;
+
+-- 7b. The guard must NOT fire on the other off-'claimed' transitions: each works
+--     with NO artifact (failed_before_delivery / cancelled / needs_human_review).
+do $$
+declare
+  st text;
+  v_fbd uuid := (select val from t_ctx where key='attempt_gfbd')::uuid;
+  v_canc uuid := (select val from t_ctx where key='attempt_gcanc')::uuid;
+  v_nhr uuid := (select val from t_ctx where key='attempt_gnhr')::uuid;
+begin
+  perform pg_temp.drive_to(v_fbd, 'claimed');
+  update public.send_attempts set state='failed_before_delivery', version=version+1 where id=v_fbd;
+  select state into st from public.send_attempts where id=v_fbd;
+  perform public.test_assert(st='failed_before_delivery',
+    'guard: claimed->failed_before_delivery works with NO artifact (guard does not fire)');
+
+  perform pg_temp.drive_to(v_canc, 'claimed');
+  update public.send_attempts set state='cancelled', version=version+1 where id=v_canc;
+  select state into st from public.send_attempts where id=v_canc;
+  perform public.test_assert(st='cancelled',
+    'guard: claimed->cancelled works with NO artifact (guard does not fire)');
+
+  perform pg_temp.drive_to(v_nhr, 'claimed');
+  update public.send_attempts set state='needs_human_review', version=version+1 where id=v_nhr;
+  select state into st from public.send_attempts where id=v_nhr;
+  perform public.test_assert(st='needs_human_review',
+    'guard: claimed->needs_human_review works with NO artifact (guard does not fire)');
+end $$;
+reset role;
+
+-- 7c. Belt-and-suspenders for the guard's re-hash: an artifact whose stored
+--     mime_sha256 disagrees with its raw_mime can NEVER exist — the BEFORE INSERT
+--     trigger blocks it (23514) even for a direct privileged insert on a claimed
+--     attempt — so the guard only ever inspects hash/size-consistent rows.
+do $$
+declare
+  v_raw bytea := decode((select val from t_ctx where key='raw_hex'), 'hex');
+  v_len bigint := (select val from t_ctx where key='raw_len')::bigint;
+  v_a uuid := (select val from t_ctx where key='attempt_gmis')::uuid;
+  v_i uuid := (select val from t_ctx where key='intent_gmis')::uuid;
+  v_msg text := (select val from t_ctx where key='msgid_gmis');
+  v_ws uuid := '7777aaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  got text := null;
+begin
+  perform pg_temp.drive_to(v_a, 'claimed');
+  begin
+    insert into transport.send_mime_artifacts
+      (send_attempt_id, send_intent_id, workspace_id, message_id, mime_sha256, size_bytes, raw_mime)
+    values (v_a, v_i, v_ws, v_msg, repeat('0',64), v_len, v_raw);  -- valid hex, WRONG digest
+    got := 'no-error';
+  exception when sqlstate '23514' then got := '23514'; when others then got := sqlstate; end;
+  perform public.test_assert(got='23514',
+    format('guard: an artifact whose stored mime_sha256 != sha256(raw_mime) cannot exist (23514, got %s)', got));
+end $$;
 
 -- =====================================================================
 -- 5. CONTENT HYGIENE — the audit trail can never carry raw MIME
